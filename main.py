@@ -54,7 +54,8 @@ def setup_experiment_dir(exp_name: Optional[str] = None, base_dir: str = "experi
     os.makedirs(backup_dir, exist_ok=True)
 
     # Find and backup all .py files recursively
-    py_files = glob.glob("**/*.py", recursive=True)
+    py_files = glob.glob("*.py", recursive=True)
+    py_files.extend(glob.glob("lib/*.py", recursive=True))
 
     for py_file in py_files:
         # Skip files in virtual environments, __pycache__, etc.
@@ -64,6 +65,8 @@ def setup_experiment_dir(exp_name: Optional[str] = None, base_dir: str = "experi
         # Create subdirectories in backup if needed
         dest_path = os.path.join(backup_dir, py_file)
         dest_dir = os.path.dirname(dest_path)
+        if "experiments" in dest_dir:
+            continue
 
         if dest_dir:
             os.makedirs(dest_dir, exist_ok=True)
