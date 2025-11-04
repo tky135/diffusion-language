@@ -14,10 +14,104 @@ import torch.nn.functional as F
 from torch import nn, optim
 import math
 import os
+import shutil
+import glob
+from datetime import datetime
 from typing import Dict, List, Optional
 from itertools import permutations
+from torch.utils.tensorboard import SummaryWriter
 
 from lib import ops as lib_ops
+
+
+def setup_experiment_dir(exp_name: Optional[str] = None, base_dir: str = "experiments") -> str:
+    """
+    Create experiment directory with timestamp and optional name.
+    Also creates a backup folder with all .py files.
+
+    Args:
+        exp_name: Optional experiment name to append to timestamp
+        base_dir: Base directory for experiments
+
+    Returns:
+        Path to the created experiment directory
+    """
+    # Create timestamp in format: YYYY-MM-DD_HH-MM-SS
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+    # Create experiment folder name
+    if exp_name:
+        exp_folder = f"{timestamp}_{exp_name}"
+    else:
+        exp_folder = timestamp
+
+    # Full path to experiment directory
+    exp_dir = os.path.join(base_dir, exp_folder)
+    os.makedirs(exp_dir, exist_ok=True)
+
+    # Create backup directory
+    backup_dir = os.path.join(exp_dir, "backup")
+    os.makedirs(backup_dir, exist_ok=True)
+
+    # Find and backup all .py files recursively
+    py_files = glob.glob("**/*.py", recursive=True)
+
+    for py_file in py_files:
+        # Skip files in virtual environments, __pycache__, etc.
+        if any(skip in py_file for skip in ["venv", "env", "__pycache__", ".git", "site-packages"]):
+            continue
+
+        # Create subdirectories in backup if needed
+        dest_path = os.path.join(backup_dir, py_file)
+        dest_dir = os.path.dirname(dest_path)
+
+        if dest_dir:
+            os.makedirs(dest_dir, exist_ok=True)
+
+        try:
+            shutil.copy2(py_file, dest_path)
+        except Exception as e:
+            print(f"Warning: Could not backup {py_file}: {e}")
+
+    print(f"\n{'='*60}")
+    print(f"Experiment directory: {exp_dir}")
+    print(f"Backed up {len([f for f in py_files if not any(skip in f for skip in ['venv', 'env', '__pycache__', '.git', 'site-packages'])])} Python files to {backup_dir}")
+    print(f"{'='*60}\n")
+
+    # Create README for experiment directory
+    readme_path = os.path.join(exp_dir, "README.md")
+    with open(readme_path, 'w') as f:
+        f.write(f"# Experiment: {exp_folder}\n\n")
+        f.write(f"Created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        f.write("## Directory Structure\n\n")
+        f.write("```\n")
+        f.write(f"{exp_folder}/\n")
+        f.write("├── backup/          # Backup of all Python source files\n")
+        f.write("├── runs/            # TensorBoard logs\n")
+        f.write("├── config.txt       # Experiment configuration\n")
+        f.write("├── checkpoint.pt    # Model checkpoint\n")
+        f.write("├── output.txt       # Training/sampling scores\n")
+        f.write("├── digit_embeddings.png     # Visualization of learned embeddings\n")
+        f.write("├── training_loss_*.png      # Loss curves\n")
+        f.write("└── README.md        # This file\n")
+        f.write("```\n\n")
+        f.write("## How to View Results\n\n")
+        f.write("### TensorBoard\n")
+        f.write("```bash\n")
+        f.write(f"tensorboard --logdir {os.path.join(exp_dir, 'runs')}\n")
+        f.write("```\n\n")
+        f.write("### Configuration\n")
+        f.write("See `config.txt` for full experiment configuration.\n\n")
+        f.write("### Checkpoint\n")
+        f.write(f"Model checkpoint is saved at `checkpoint.pt`\n\n")
+        f.write("To load:\n")
+        f.write("```python\n")
+        f.write("checkpoint = torch.load('checkpoint.pt')\n")
+        f.write("model.load_state_dict(checkpoint['model_state_dict'])\n")
+        f.write("embedding.load_state_dict(checkpoint['embedding_state_dict'])\n")
+        f.write("```\n")
+
+    return exp_dir
 
 
 def get_dispersion_loss(x_feature):
@@ -467,9 +561,6 @@ class SimpleDiffusionModel(nn.Module):
 
 
 def main(**args):
-    
-    score_output_file = "output.txt"
-    out_f = open(score_output_file, 'a')
     # Default arguments
     def _coerce_bool(value, default):
         if value is None:
@@ -479,6 +570,10 @@ def main(**args):
         if isinstance(value, str):
             return value.lower() in {"1", "true", "yes", "y", "on"}
         return bool(value)
+
+    # Setup experiment directory
+    exp_name = args.get('exp_name', None)
+    exp_dir = setup_experiment_dir(exp_name=exp_name, base_dir="experiments")
 
     # Dataset selection
     dataset_type = str(args.get('dataset', 'simple')).lower()
@@ -497,16 +592,27 @@ def main(**args):
     hidden_dim = args.get('hidden_dim', 32)
     n_blocks = args.get('n_blocks', 4)
     n_heads = args.get('n_heads', 4)
-    embed_plot_path = args.get('embed_plot_path', 'digit_embeddings.png')
-    loss_plot_path = args.get('loss_plot_path', 'training_loss.png')
+
+    # Setup paths relative to experiment directory
+    embed_plot_path = args.get('embed_plot_path', os.path.join(exp_dir, 'digit_embeddings.png'))
+    loss_plot_path = args.get('loss_plot_path', os.path.join(exp_dir, 'training_loss.png'))
+    checkpoint_path = args.get('checkpoint_path', os.path.join(exp_dir, 'checkpoint.pt'))
+    load_checkpoint_path = args.get('resume_from', None)
+    tensorboard_log_dir = args.get('tensorboard_log_dir', os.path.join(exp_dir, 'runs'))
+    score_output_file = os.path.join(exp_dir, 'output.txt')
+
     plot_loss_curve = _coerce_bool(args.get('plot_loss_curve', True), True)
     show_loss_plot = _coerce_bool(args.get('show_loss_plot', False), False)
     embedding_type = str(args.get('embedding_type', 'learned')).lower()
     positional_encoding = str(args.get('positional_encoding', 'learned')).lower()
-    checkpoint_path = args.get('checkpoint_path', 'simple_diffusion_checkpoint.pt')
-    load_checkpoint_path = args.get('load_checkpoint_path', checkpoint_path)
     sampling_only = args.get('sampling_only', False)
     resume = args.get('resume', False)
+    
+    if load_checkpoint_path is not None:
+        resume = True
+        
+    if resume is True and load_checkpoint_path is None:
+        load_checkpoint_path = checkpoint_path
 
     # DDPM-style noise schedule parameters
     num_timesteps = args.get('num_timesteps', 1000)
@@ -590,6 +696,7 @@ def main(**args):
     print("="*60)
     print("Simple Diffusion Model for Sequential Data (DDPM)")
     print("="*60)
+    print(f"Experiment directory: {exp_dir}")
     print(f"dataset: {dataset_type}")
     print(f"vocab_size: {vocab_size}, seq_len: {seq_len}")
     print(f"batch_size: {batch_size}")
@@ -603,6 +710,46 @@ def main(**args):
     print(f"positional_encoding: {positional_encoding}")
     print("="*60)
     print()
+
+    # Open output file for scores
+    out_f = open(score_output_file, 'w')
+
+    # Save experiment configuration
+    config_file = os.path.join(exp_dir, 'config.txt')
+    with open(config_file, 'w') as cf:
+        cf.write("="*60 + "\n")
+        cf.write("Experiment Configuration\n")
+        cf.write("="*60 + "\n")
+        cf.write(f"Experiment directory: {exp_dir}\n")
+        cf.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        cf.write(f"\nDataset Configuration:\n")
+        cf.write(f"  dataset: {dataset_type}\n")
+        cf.write(f"  vocab_size: {vocab_size}\n")
+        cf.write(f"  seq_len: {seq_len}\n")
+        cf.write(f"\nTraining Configuration:\n")
+        cf.write(f"  batch_size: {batch_size}\n")
+        cf.write(f"  lr: {lr}\n")
+        cf.write(f"  lr_decay: {lr_decay}\n")
+        cf.write(f"  lr_decay_end: {lr_decay_end}\n")
+        cf.write(f"  lr_warmup_steps: {lr_warmup_steps}\n")
+        cf.write(f"  steps: {steps}\n")
+        cf.write(f"\nModel Configuration:\n")
+        cf.write(f"  embed_dim: {embed_dim}\n")
+        cf.write(f"  hidden_dim: {hidden_dim}\n")
+        cf.write(f"  n_blocks: {n_blocks}\n")
+        cf.write(f"  n_heads: {n_heads}\n")
+        cf.write(f"  embedding_type: {embedding_type}\n")
+        cf.write(f"  positional_encoding: {positional_encoding}\n")
+        cf.write(f"\nDiffusion Configuration:\n")
+        cf.write(f"  num_timesteps: {num_timesteps}\n")
+        cf.write(f"  beta_start: {beta_start}\n")
+        cf.write(f"  beta_end: {beta_end}\n")
+        cf.write(f"\nFile Paths:\n")
+        cf.write(f"  checkpoint: {checkpoint_path}\n")
+        cf.write(f"  tensorboard_logs: {tensorboard_log_dir}\n")
+        cf.write(f"  embed_plot: {embed_plot_path}\n")
+        cf.write(f"  loss_plot: {loss_plot_path}\n")
+        cf.write("="*60 + "\n")
 
     # Setup embedding
     if embedding_type == "onehot":
@@ -691,6 +838,31 @@ def main(**args):
     one_tensor = torch.tensor(1.0, device=device, dtype=dtype)
 
     if not sampling_only:
+        # Initialize TensorBoard writer
+        writer = SummaryWriter(log_dir=tensorboard_log_dir)
+        print(f"TensorBoard logging to: {tensorboard_log_dir}")
+
+        # Log hyperparameters
+        hparams = {
+            'dataset': dataset_type,
+            'batch_size': batch_size,
+            'lr': lr,
+            'lr_decay': lr_decay,
+            'lr_warmup_steps': lr_warmup_steps,
+            'embed_dim': embed_dim,
+            'hidden_dim': hidden_dim,
+            'n_blocks': n_blocks,
+            'n_heads': n_heads,
+            'num_timesteps': num_timesteps,
+            'beta_start': beta_start,
+            'beta_end': beta_end,
+            'embedding_type': embedding_type,
+            'positional_encoding': positional_encoding,
+            'vocab_size': vocab_size,
+            'seq_len': seq_len,
+        }
+        # Add hyperparameters to TensorBoard (note: metrics will be added at the end)
+
         # Training loop
         print("Starting training...")
         print(f"{'Step':<10} {'Loss':<12} {'Acc@t=0':<12}")
@@ -781,7 +953,7 @@ def main(**args):
             diffusion_losses.append(float(diffusion_loss.detach()))
             prior_losses.append(float(prior_loss.detach()))
 
-            # Print progress
+            # Print progress and log to TensorBoard
             if step % print_freq == 0 or step == steps - 1:
                 total_diffusion = diffusion_vals.mean().item()
                 reconst_val = reconst_loss.item() if reconst_bs > 0 else 0.0
@@ -795,13 +967,42 @@ def main(**args):
                     logits_clean = model(z_clean, t_zero_continuous)
                     preds = logits_clean.argmax(dim=-1)
                     acc = (preds == x).float().mean().item()
+
+                # TensorBoard logging
+                writer.add_scalar('Loss/total', loss.item(), step)
+                writer.add_scalar('Loss/reconstruction', reconst_val, step)
+                writer.add_scalar('Loss/diffusion', diff_tail_val, step)
+                writer.add_scalar('Loss/prior', prior_loss.item(), step)
+                writer.add_scalar('Loss/dispersion', dispersive_loss.item(), step)
+                writer.add_scalar('Loss/diffusion_mean', total_diffusion, step)
+                writer.add_scalar('Metrics/accuracy_t0', acc, step)
+                writer.add_scalar('Hyperparameters/learning_rate', scheduler.get_last_lr()[0], step)
+
+                # Log embeddings periodically
+                if step % (print_freq * 10) == 0:
+                    emb_matrix = embedding().detach().cpu()
+                    writer.add_embedding(
+                        emb_matrix,
+                        metadata=[str(i) for i in range(vocab_size)],
+                        global_step=step,
+                        tag='embeddings'
+                    )
+
+                # Log model parameter histograms periodically
+                if step % (print_freq * 10) == 0:
+                    for name, param in model.named_parameters():
+                        if param.requires_grad:
+                            writer.add_histogram(f'Model/{name}', param.data, step)
+                            if param.grad is not None:
+                                writer.add_histogram(f'Model/{name}.grad', param.grad, step)
+
                 print(embedding())
                 print(f"{step:>6} | recon={reconst_val:.4f} diff_tail={diff_tail_val:.4f} prior={prior_loss.item():.4f} "
                       f"loss={loss.item():.4f} (diff_mean={total_diffusion:.4f}) disp_loss={dispersive_loss:.4f} acc={acc:.4f}")
 
 
             if step % 10000 == 0:
-                n_samples = args.get('n_samples', 1000)
+                n_samples = args.get('n_samples', 10000)
                 sampling_steps = args.get('sampling_steps', num_timesteps)
                 sampling_eta = args.get('sampling_eta', 0.0)
                 sampling_start_t = args.get('sampling_start_t', num_timesteps - 1)
@@ -892,23 +1093,38 @@ def main(**args):
                     final_preds = final_logits.argmax(dim=-1)
 
                     print("\nFinal generated sequences (after all denoising steps):")
+
+                    # Log sample outputs to TensorBoard
+                    sample_text = []
                     if dataset_type == 'sudoku':
                         for i in range(min(10, n_samples)):
                             print(f"  Sample {i+1}:")
+                            grid_str = str(final_preds[i].reshape(9, 9).cpu().numpy())
                             print(final_preds[i].reshape(9, 9))
+                            sample_text.append(f"Sample {i+1}:\n{grid_str}\n")
                             print()
 
                     elif dataset_type == 'sudoku_simple':
                         for i in range(min(20, n_samples)):
-                            print(f"  Sample {i+1} (row): {final_preds[i].tolist()}")
+                            sample_str = f"Sample {i+1} (row): {final_preds[i].tolist()}"
+                            print(f"  {sample_str}")
+                            sample_text.append(sample_str)
 
                     elif dataset_type == 'sudoku_tiny':
                         for i in range(min(30, n_samples)):
-                            print(f"  Sample {i+1}: {final_preds[i].tolist()}")
+                            sample_str = f"Sample {i+1}: {final_preds[i].tolist()}"
+                            print(f"  {sample_str}")
+                            sample_text.append(sample_str)
 
                     else:
                         for i in range(min(50, n_samples)):
-                            print(f"  Sample {i+1}: {final_preds[i].tolist()}")
+                            sample_str = f"Sample {i+1}: {final_preds[i].tolist()}"
+                            print(f"  {sample_str}")
+                            sample_text.append(sample_str)
+
+                    # Log samples to TensorBoard
+                    if sample_text:
+                        writer.add_text('Samples/generated', '\n'.join(sample_text[:10]), step)
 
                     # Pattern analysis
                     print("\nPattern analysis:")
@@ -961,8 +1177,14 @@ def main(**args):
                         valid_count = sum(valid_patterns)
                         print(f"\nValid Sudoku grids: {valid_count}/{n_samples}")
                         accuracy_pct = 100.0 * valid_count / n_samples if n_samples > 0 else 0.0
+                        avg_score = np.mean(score_list)
                         print(f"Sampling accuracy: {accuracy_pct:.2f}%", file=out_f, flush=True)
-                        print(f"Sampling score: ", np.mean(score_list), file=out_f, flush=True)
+                        print(f"Sampling score: ", avg_score, file=out_f, flush=True)
+
+                        # TensorBoard logging
+                        writer.add_scalar('Sampling/accuracy', accuracy_pct, step)
+                        writer.add_scalar('Sampling/score', avg_score, step)
+                        writer.add_scalar('Sampling/valid_count', valid_count, step)
 
                     elif dataset_type == 'sudoku_simple':
                         # Valid Sudoku row: digits 1..9 exactly once
@@ -977,6 +1199,10 @@ def main(**args):
                         accuracy_pct = 100.0 * valid_count / n_samples if n_samples > 0 else 0.0
                         print(f"Sampling accuracy (row uniqueness 1..9): {accuracy_pct:.2f}%")
 
+                        # TensorBoard logging
+                        writer.add_scalar('Sampling/accuracy', accuracy_pct, step)
+                        writer.add_scalar('Sampling/valid_count', valid_count, step)
+
                     elif dataset_type == 'sudoku_tiny':
                         # Valid row = permutation of {0,1,2,3}
                         target = set([0, 1, 2, 3])
@@ -989,6 +1215,10 @@ def main(**args):
                         print(f"\nValid permutations: {valid_count}/{n_samples}")
                         accuracy_pct = 100.0 * valid_count / n_samples if n_samples > 0 else 0.0
                         print(f"Sampling accuracy (perm of 0..3): {accuracy_pct:.2f}%")
+
+                        # TensorBoard logging
+                        writer.add_scalar('Sampling/accuracy', accuracy_pct, step)
+                        writer.add_scalar('Sampling/valid_count', valid_count, step)
                     elif dataset_type == 'randompair':
                         valid_patterns = []
                         for i in range(n_samples):
@@ -1000,6 +1230,10 @@ def main(**args):
                         print(f"\nValid sequential patterns: {valid_count}/{n_samples}")
                         accuracy_pct = 100.0 * valid_count / n_samples if n_samples > 0 else 0.0
                         print(f"Sampling accuracy: {accuracy_pct:.2f}%")
+
+                        # TensorBoard logging
+                        writer.add_scalar('Sampling/accuracy', accuracy_pct, step)
+                        writer.add_scalar('Sampling/valid_count', valid_count, step)
                     elif dataset_type == 'sequential':
                         # Original sequential pattern check
                         valid_patterns = []
@@ -1012,6 +1246,10 @@ def main(**args):
                         print(f"\nValid sequential patterns: {valid_count}/{n_samples}")
                         accuracy_pct = 100.0 * valid_count / n_samples if n_samples > 0 else 0.0
                         print(f"Sampling accuracy: {accuracy_pct:.2f}%")
+
+                        # TensorBoard logging
+                        writer.add_scalar('Sampling/accuracy', accuracy_pct, step)
+                        writer.add_scalar('Sampling/valid_count', valid_count, step)
 
         print("\n" + "="*60)
         print("Training completed!")
@@ -1173,11 +1411,35 @@ def main(**args):
             print(f"Overall Accuracy: {accuracy:.2%} ({all_correct}/{total_tokens} tokens correct)")
             print(embedding())
 
+            # TensorBoard logging for final evaluation
+            writer.add_scalar('Evaluation/final_accuracy', accuracy * 100, steps)
+            writer.add_scalar('Evaluation/correct_tokens', all_correct, steps)
+            writer.add_scalar('Evaluation/total_tokens', total_tokens, steps)
+
+            # Log hyperparameters with final metrics
+            metric_dict = {
+                'hparam/final_accuracy': accuracy * 100,
+                'hparam/final_loss': total_losses[-1] if total_losses else 0.0,
+            }
+            writer.add_hparams(hparams, metric_dict)
+
+            # Log embedding visualization
             visualize_embeddings(embedding(), embed_plot_path)
+            if os.path.exists(embed_plot_path):
+                try:
+                    import matplotlib.pyplot as plt
+                    img = plt.imread(embed_plot_path)
+                    writer.add_image('Embeddings/visualization', img, steps, dataformats='HWC')
+                except Exception as e:
+                    print(f"Could not log embedding image to TensorBoard: {e}")
 
         print("\n" + "="*60)
         print("Test complete!")
         print("="*60)
+
+        # Close TensorBoard writer
+        writer.close()
+        print(f"TensorBoard logs saved to: {tensorboard_log_dir}")
     else:
         if not load_checkpoint_path:
             raise ValueError("sampling_only=True requires 'load_checkpoint_path' to be specified")
@@ -1213,7 +1475,7 @@ def main(**args):
         print(f"Starting from pure Gaussian noise and denoising to clean data")
         print()
 
-        n_samples = args.get('n_samples', 1000)
+        n_samples = args.get('n_samples', 10000)
         sampling_steps = args.get('sampling_steps', num_timesteps)
         sampling_eta = args.get('sampling_eta', 0.0)
         sampling_start_t = args.get('sampling_start_t', num_timesteps - 1)
@@ -1424,6 +1686,10 @@ def main(**args):
                 print(f"\nValid sequential patterns: {valid_count}/{n_samples}")
                 accuracy_pct = 100.0 * valid_count / n_samples if n_samples > 0 else 0.0
                 print(f"Sampling accuracy: {accuracy_pct:.2f}%")
+
+    # Close output file
+    out_f.close()
+    print(f"\nAll outputs saved to: {exp_dir}")
 
 
 if __name__ == '__main__':
