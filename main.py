@@ -23,6 +23,10 @@ from torch.utils.tensorboard import SummaryWriter
 
 from lib import ops as lib_ops
 
+# Import GPT2 components from transformers
+from transformers import GPT2Config
+from transformers.models.gpt2.modeling_gpt2 import GPT2Block as TransformersGPT2Block
+
 
 def setup_experiment_dir(exp_name: Optional[str] = None, base_dir: str = "experiments") -> str:
     """
@@ -422,6 +426,51 @@ class SimpleTransformerBlock(nn.Module):
         return x
 
 
+class GPT2Block(nn.Module):
+    """Wrapper for transformers GPT2Block with simplified interface for diffusion."""
+    def __init__(self, hidden_size, num_attention_heads, intermediate_size=None,
+                 layer_norm_epsilon=1e-5, attn_pdrop=0.1, resid_pdrop=0.1):
+        super().__init__()
+
+        if intermediate_size is None:
+            intermediate_size = 4 * hidden_size
+
+        # Create GPT2Config for the block
+        config = GPT2Config(
+            n_embd=hidden_size,
+            n_head=num_attention_heads,
+            n_inner=intermediate_size,
+            layer_norm_epsilon=layer_norm_epsilon,
+            attn_pdrop=attn_pdrop,
+            resid_pdrop=resid_pdrop,
+            embd_pdrop=0.0,  # Not used in block
+            activation_function="gelu_new",
+            scale_attn_weights=True,
+            scale_attn_by_inverse_layer_idx=False,
+            reorder_and_upcast_attn=False,
+        )
+
+        # Set attention implementation to 'eager' (standard PyTorch attention)
+        config._attn_implementation = "eager"
+
+        # Use the actual GPT2Block from transformers
+        self.block = TransformersGPT2Block(config, layer_idx=0)
+
+    def forward(self, x):
+        """
+        Args:
+            x: [batch, seq_len, hidden_size]
+        Returns:
+            [batch, seq_len, hidden_size]
+        """
+        # Call transformers GPT2Block
+        # It returns a tuple, we only need the hidden states
+        outputs = self.block(x)
+
+        # GPT2Block returns a tuple where first element is hidden_states
+        return outputs[0]
+
+
 class SimpleDiffusionModel(nn.Module):
     """
     Simplified diffusion model for discrete sequences.
@@ -462,9 +511,17 @@ class SimpleDiffusionModel(nn.Module):
             nn.Linear(hidden_dim, hidden_dim)
         )
 
-        # Transformer blocks
+        # GPT2-style transformer blocks (3 layers as per tiny GPT2)
+        # Using GPT2 architecture with configurable parameters
         self.blocks = nn.ModuleList([
-            SimpleTransformerBlock(hidden_dim, n_heads)
+            GPT2Block(
+                hidden_size=hidden_dim,
+                num_attention_heads=n_heads,
+                intermediate_size=4 * hidden_dim,  # Standard GPT2 MLP expansion
+                layer_norm_epsilon=1e-5,
+                attn_pdrop=0.1,
+                resid_pdrop=0.1
+            )
             for _ in range(n_blocks)
         ])
 
