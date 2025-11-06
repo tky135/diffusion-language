@@ -465,7 +465,14 @@ class GPT2Block(nn.Module):
         """
         # Call transformers GPT2Block
         # It returns a tuple, we only need the hidden states
-        outputs = self.block(x)
+        batch_size, seq_len, _ = x.shape
+        attention_mask = torch.ones(
+            batch_size, 1, 1, seq_len,
+            dtype=torch.float32,
+            device=x.device
+        )
+        outputs = self.block(x, attention_mask=attention_mask)
+
 
         # GPT2Block returns a tuple where first element is hidden_states
         return outputs[0]
@@ -476,8 +483,9 @@ class SimpleDiffusionModel(nn.Module):
     Simplified diffusion model for discrete sequences.
     Takes noisy embeddings and predicts clean embeddings.
     """
-    def __init__(self, embed_dim, hidden_dim, n_blocks, n_heads, vocab_size, seq_len, 
-                 positional_encoding: str = "learned", dataset_type: str = "simple"):
+    def __init__(self, embed_dim, hidden_dim, n_blocks, n_heads, vocab_size, seq_len,
+                 positional_encoding: str = "learned", dataset_type: str = "simple",
+                 transformer_block_type: str = "simple"):
         super().__init__()
         self.embed_dim = embed_dim
         self.hidden_dim = hidden_dim
@@ -485,6 +493,11 @@ class SimpleDiffusionModel(nn.Module):
         self.seq_len = seq_len
         self.positional_encoding = positional_encoding.lower()
         self.dataset_type = dataset_type.lower()
+        self.transformer_block_type = transformer_block_type.lower()
+
+        # Validate transformer block type
+        if self.transformer_block_type not in ["simple", "gpt2"]:
+            raise ValueError(f"transformer_block_type must be 'simple' or 'gpt2', got '{transformer_block_type}'")
 
         # Project embedding to hidden dimension
         self.input_proj = nn.Linear(embed_dim, hidden_dim, bias=False)
@@ -511,19 +524,27 @@ class SimpleDiffusionModel(nn.Module):
             nn.Linear(hidden_dim, hidden_dim)
         )
 
-        # GPT2-style transformer blocks (3 layers as per tiny GPT2)
-        # Using GPT2 architecture with configurable parameters
-        self.blocks = nn.ModuleList([
-            GPT2Block(
-                hidden_size=hidden_dim,
-                num_attention_heads=n_heads,
-                intermediate_size=4 * hidden_dim,  # Standard GPT2 MLP expansion
-                layer_norm_epsilon=1e-5,
-                attn_pdrop=0.1,
-                resid_pdrop=0.1
-            )
-            for _ in range(n_blocks)
-        ])
+        # Transformer blocks - choose between SimpleTransformerBlock or GPT2Block
+        if self.transformer_block_type == "simple":
+            # Original simple transformer implementation (no bias, no dropout)
+            self.blocks = nn.ModuleList([
+                SimpleTransformerBlock(hidden_dim, n_heads)
+                for _ in range(n_blocks)
+            ])
+        elif self.transformer_block_type == "gpt2":
+            # GPT2-style transformer blocks from transformers library
+            # NOTE: Dropout set to 0.0 for diffusion models (better for small datasets and determinism)
+            self.blocks = nn.ModuleList([
+                GPT2Block(
+                    hidden_size=hidden_dim,
+                    num_attention_heads=n_heads,
+                    intermediate_size=4 * hidden_dim,  # Standard GPT2 MLP expansion
+                    layer_norm_epsilon=1e-5,
+                    attn_pdrop=0.0,  
+                    resid_pdrop=0.0 
+                )
+                for _ in range(n_blocks)
+            ])
 
         # Output projection
         self.norm_out = nn.LayerNorm(hidden_dim)
@@ -665,6 +686,7 @@ def main(**args):
     show_loss_plot = _coerce_bool(args.get('show_loss_plot', False), False)
     embedding_type = str(args.get('embedding_type', 'learned')).lower()
     positional_encoding = str(args.get('positional_encoding', 'learned')).lower()
+    transformer_block_type = str(args.get('transformer_block_type', 'simple')).lower()  # 'simple' or 'gpt2'
     sampling_only = args.get('sampling_only', False)
     resume = args.get('resume', False)
     
@@ -768,6 +790,7 @@ def main(**args):
     print(f"beta_start: {beta_start}, beta_end: {beta_end}")
     print(f"embedding_type: {embedding_type}")
     print(f"positional_encoding: {positional_encoding}")
+    print(f"transformer_block_type: {transformer_block_type}")
     print("="*60)
     print()
 
@@ -800,6 +823,7 @@ def main(**args):
         cf.write(f"  n_heads: {n_heads}\n")
         cf.write(f"  embedding_type: {embedding_type}\n")
         cf.write(f"  positional_encoding: {positional_encoding}\n")
+        cf.write(f"  transformer_block_type: {transformer_block_type}\n")
         cf.write(f"\nDiffusion Configuration:\n")
         cf.write(f"  num_timesteps: {num_timesteps}\n")
         cf.write(f"  beta_start: {beta_start}\n")
@@ -835,7 +859,8 @@ def main(**args):
         vocab_size=vocab_size,
         seq_len=seq_len,
         positional_encoding=positional_encoding,
-        dataset_type=dataset_type  # NEW: Pass dataset_type to model
+        dataset_type=dataset_type,
+        transformer_block_type=transformer_block_type  # NEW: Pass block type to model
     ).to(device)
 
     # Count parameters
@@ -855,6 +880,11 @@ def main(**args):
         if saved_embedding_type != embedding_type:
             raise ValueError(
                 "Checkpoint embedding_type='" + saved_embedding_type + "' does not match requested embedding_type='" + embedding_type + "'."
+            )
+        saved_block_type = str(checkpoint_config.get('transformer_block_type', transformer_block_type)).lower()
+        if saved_block_type != transformer_block_type:
+            raise ValueError(
+                "Checkpoint transformer_block_type='" + saved_block_type + "' does not match requested transformer_block_type='" + transformer_block_type + "'."
             )
         embedding.load_state_dict(checkpoint['embedding_state_dict'])
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -1061,8 +1091,8 @@ def main(**args):
                       f"loss={loss.item():.4f} (diff_mean={total_diffusion:.4f}) disp_loss={dispersive_loss:.4f} acc={acc:.4f}")
 
 
-            if step % 10000 == 0:
-                n_samples = args.get('n_samples', 10000)
+            if step % 1000 == 0:
+                n_samples = args.get('n_samples', 100)
                 sampling_steps = args.get('sampling_steps', num_timesteps)
                 sampling_eta = args.get('sampling_eta', 0.0)
                 sampling_start_t = args.get('sampling_start_t', num_timesteps - 1)
@@ -1341,6 +1371,7 @@ def main(**args):
                         'seq_len': seq_len,
                         'positional_encoding': positional_encoding,
                         'embedding_type': embedding_type,
+                        'transformer_block_type': transformer_block_type,
                     },
                 },
                 checkpoint_path
@@ -1535,7 +1566,7 @@ def main(**args):
         print(f"Starting from pure Gaussian noise and denoising to clean data")
         print()
 
-        n_samples = args.get('n_samples', 10000)
+        n_samples = args.get('n_samples', 1000)
         sampling_steps = args.get('sampling_steps', num_timesteps)
         sampling_eta = args.get('sampling_eta', 0.0)
         sampling_start_t = args.get('sampling_start_t', num_timesteps - 1)
