@@ -541,7 +541,7 @@ class SimpleDiffusionModel(nn.Module):
                     intermediate_size=4 * hidden_dim,  # Standard GPT2 MLP expansion
                     layer_norm_epsilon=1e-5,
                     attn_pdrop=0.0,  
-                    resid_pdrop=0.0 
+                    resid_pdrop=0.1 
                 )
                 for _ in range(n_blocks)
             ])
@@ -1566,7 +1566,7 @@ def main(**args):
         print(f"Starting from pure Gaussian noise and denoising to clean data")
         print()
 
-        n_samples = args.get('n_samples', 1000)
+        n_samples = args.get('n_samples', 10000)
         sampling_steps = args.get('sampling_steps', num_timesteps)
         sampling_eta = args.get('sampling_eta', 0.0)
         sampling_start_t = args.get('sampling_start_t', num_timesteps - 1)
