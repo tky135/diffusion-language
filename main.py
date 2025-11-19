@@ -20,9 +20,9 @@ from datetime import datetime
 from typing import Dict, List, Optional
 from itertools import permutations
 from torch.utils.tensorboard import SummaryWriter
-
+from einops import rearrange
 from lib import ops as lib_ops
-
+from ipdb import iex
 # Import GPT2 components from transformers
 from transformers import GPT2Config
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block as TransformersGPT2Block
@@ -485,7 +485,7 @@ class SimpleDiffusionModel(nn.Module):
     """
     def __init__(self, embed_dim, hidden_dim, n_blocks, n_heads, vocab_size, seq_len,
                  positional_encoding: str = "learned", dataset_type: str = "simple",
-                 transformer_block_type: str = "simple"):
+                 transformer_block_type: str = "simple", enable_repae: bool = False):
         super().__init__()
         self.embed_dim = embed_dim
         self.hidden_dim = hidden_dim
@@ -494,6 +494,10 @@ class SimpleDiffusionModel(nn.Module):
         self.positional_encoding = positional_encoding.lower()
         self.dataset_type = dataset_type.lower()
         self.transformer_block_type = transformer_block_type.lower()
+        self.enable_repae = enable_repae
+
+        # Storage for intermediate layer activations (REPAE)
+        self.layer_activations = []
 
         # Validate transformer block type
         if self.transformer_block_type not in ["simple", "gpt2"]:
@@ -620,6 +624,10 @@ class SimpleDiffusionModel(nn.Module):
         Returns:
             logits: predicted token logits [batch, seq_len, vocab_size]
         """
+        # Clear previous activations if REPAE is enabled
+        if self.enable_repae:
+            self.layer_activations = []
+
         x = self.input_proj(z)  # [B, T, hidden_dim]
 
         # Positional information
@@ -631,16 +639,44 @@ class SimpleDiffusionModel(nn.Module):
         time_emb = self.time_mlp(time_emb)                          # [B, hidden_dim]
         x = x + time_emb[:, None, :]
 
+        # Store initial embedding if REPAE is enabled
+        if self.enable_repae:
+            self.layer_activations.append(x)
+
         # Transformer blocks
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
             x = block(x)
+            # Store activation after each block if REPAE is enabled
+            if self.enable_repae:
+                self.layer_activations.append(x)
 
         # Output projection
         x = self.norm_out(x)
         logits = self.output_proj(x)  # [B, T, vocab_size]
         return logits
 
+    def get_layer_activations(self):
+        """
+        Get the stored layer activations (REPAE).
 
+        Returns:
+            List of tensors, where each tensor is [batch, seq_len, hidden_dim]
+            Index 0: after input projection + positional + time embedding
+            Index 1 to n_blocks: after each transformer block
+        """
+        if not self.enable_repae:
+            raise RuntimeError("REPAE is not enabled. Set enable_repae=True when creating the model.")
+        return self.layer_activations
+
+    def clear_layer_activations(self):
+        """Clear the stored layer activations to free memory."""
+        self.layer_activations = []
+
+    def get_num_layers(self):
+        """Return the number of transformer blocks."""
+        return len(self.blocks)
+
+@iex
 def main(**args):
     # Default arguments
     def _coerce_bool(value, default):
@@ -687,6 +723,7 @@ def main(**args):
     embedding_type = str(args.get('embedding_type', 'learned')).lower()
     positional_encoding = str(args.get('positional_encoding', 'learned')).lower()
     transformer_block_type = str(args.get('transformer_block_type', 'simple')).lower()  # 'simple' or 'gpt2'
+    repae = _coerce_bool(args.get('repae', False), False)  # REPAE option
     sampling_only = args.get('sampling_only', False)
     resume = args.get('resume', False)
     
@@ -791,6 +828,7 @@ def main(**args):
     print(f"embedding_type: {embedding_type}")
     print(f"positional_encoding: {positional_encoding}")
     print(f"transformer_block_type: {transformer_block_type}")
+    print(f"repae: {repae}")
     print("="*60)
     print()
 
@@ -824,6 +862,7 @@ def main(**args):
         cf.write(f"  embedding_type: {embedding_type}\n")
         cf.write(f"  positional_encoding: {positional_encoding}\n")
         cf.write(f"  transformer_block_type: {transformer_block_type}\n")
+        cf.write(f"  repae: {repae}\n")
         cf.write(f"\nDiffusion Configuration:\n")
         cf.write(f"  num_timesteps: {num_timesteps}\n")
         cf.write(f"  beta_start: {beta_start}\n")
@@ -860,8 +899,40 @@ def main(**args):
         seq_len=seq_len,
         positional_encoding=positional_encoding,
         dataset_type=dataset_type,
-        transformer_block_type=transformer_block_type  # NEW: Pass block type to model
+        transformer_block_type=transformer_block_type,  # Pass block type to model
+        enable_repae=repae  # Enable REPAE hooks if requested
     ).to(device)
+
+    # Print REPAE status
+    if repae:
+        print("\n" + "="*60)
+        print("REPAE (Representation Engineering) ENABLED")
+        print("="*60)
+        print(f"Will capture activations at {model.get_num_layers() + 1} positions:")
+        print(f"  - Layer 0: After input projection + positional + time embedding")
+        for i in range(model.get_num_layers()):
+            print(f"  - Layer {i+1}: After transformer block {i}")
+        print("\nUsage in Python:")
+        print("  # After forward pass, access activations:")
+        print("  activations = model.get_layer_activations()  # or get_layer_activations() helper")
+        print("  # activations is a list of tensors, each shape [batch, seq_len, hidden_dim]")
+        print("  # Clear to free memory: model.clear_layer_activations()")
+        print("="*60 + "\n")
+
+
+    # Helper function to get embedding matrix
+    def get_embedding_matrix():
+        """Get the full embedding matrix"""
+        return embedding()
+
+    # Helper function to access model methods
+    def get_layer_activations():
+        """Get layer activations from model"""
+        return model.get_layer_activations()
+
+    def clear_layer_activations():
+        """Clear layer activations from model"""
+        model.clear_layer_activations()
 
     # Count parameters
     total_params = sum(p.numel() for p in embedding.parameters()) + \
@@ -886,12 +957,21 @@ def main(**args):
             raise ValueError(
                 "Checkpoint transformer_block_type='" + saved_block_type + "' does not match requested transformer_block_type='" + transformer_block_type + "'."
             )
+
         embedding.load_state_dict(checkpoint['embedding_state_dict'])
         model.load_state_dict(checkpoint['model_state_dict'])
 
-    # Optimizer
-    optimizer = optim.AdamW(
-        list(model.parameters()) + list(embedding.parameters()),
+    # Optimizers - separate for model and embedding
+    # Model optimizer: updated by main loss (reconstruction + diffusion + prior)
+    optimizer_model = optim.AdamW(
+        model.parameters(),
+        lr=lr,
+        weight_decay=1e-5
+    )
+
+    # Embedding optimizer: updated by dispersive loss only
+    optimizer_embedding = optim.AdamW(
+        embedding.parameters(),
         lr=lr,
         weight_decay=1e-5
     )
@@ -910,7 +990,27 @@ def main(**args):
         target_ratio = lr_decay_end / lr
         return target_ratio + (1.0 - target_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
 
-    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    # Create separate schedulers for each optimizer (same schedule for both)
+    scheduler_model = optim.lr_scheduler.LambdaLR(optimizer_model, lr_lambda)
+    scheduler_embedding = optim.lr_scheduler.LambdaLR(optimizer_embedding, lr_lambda)
+
+    # Load optimizer and scheduler states if resuming
+    if resume:
+        checkpoint = torch.load(load_checkpoint_path, map_location=device)
+        # Load optimizer states if they exist in checkpoint
+        if 'optimizer_model_state_dict' in checkpoint:
+            optimizer_model.load_state_dict(checkpoint['optimizer_model_state_dict'])
+            print("Loaded model optimizer state from checkpoint")
+        if 'optimizer_embedding_state_dict' in checkpoint:
+            optimizer_embedding.load_state_dict(checkpoint['optimizer_embedding_state_dict'])
+            print("Loaded embedding optimizer state from checkpoint")
+        # Load scheduler states if they exist in checkpoint
+        if 'scheduler_model_state_dict' in checkpoint:
+            scheduler_model.load_state_dict(checkpoint['scheduler_model_state_dict'])
+            print("Loaded model scheduler state from checkpoint")
+        if 'scheduler_embedding_state_dict' in checkpoint:
+            scheduler_embedding.load_state_dict(checkpoint['scheduler_embedding_state_dict'])
+            print("Loaded embedding scheduler state from checkpoint")
 
     # Move noise schedule to device
     dtype = torch.float32
@@ -993,7 +1093,7 @@ def main(**args):
 
             # Predicted embedding reconstruction
             probs = F.softmax(logits, dim=-1)
-            embedding_matrix = embedding()
+            embedding_matrix = get_embedding_matrix()
             x_reconst = probs @ embedding_matrix
 
             # Reconstruction loss (first reconst_bs elements)
@@ -1028,15 +1128,68 @@ def main(**args):
                 loss = loss + reconst_loss
             if diffusion_tail.numel() > 0:
                 loss = loss + diffusion_loss
-            
-            dispersive_loss = get_dispersion_loss(embedding().repeat(batch_size, 1))
 
-            loss = loss + dispersive_loss * 1e1
-            # Backward pass
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
+            ### Option #1: directly on embeddings (COMMENTED OUT)
+            dispersive_loss = get_dispersion_loss(get_embedding_matrix().repeat(batch_size, 1)) * 1e1
+
+            ### Option #3: dispersive loss on layer activations, gradient only affects embeddings
+            # Computed separately - will be handled by separate embedding optimizer
+            if repae:
+                repae_layers = [0, 1, 2, 3, 4]
+                repae_dispersive_loss = 0
+                for layer_idx in repae_layers:
+                    repae_dispersive_loss += get_dispersion_loss(rearrange(model.layer_activations[layer_idx], 'b l d -> (b l) d'))
+                
+                repae_dispersive_loss = repae_dispersive_loss / len(repae_layers)
+                dispersive_loss = dispersive_loss + repae_dispersive_loss * 1e1
+
+            # else:
+            #     dispersive_loss = torch.tensor(0.0, device=device)
+
+            # Backward pass with separate optimizers
+            # Use torch.autograd.grad() to selectively compute gradients
+            optimizer_model.zero_grad()
+            optimizer_embedding.zero_grad()
+
+            if repae:
+                # Compute gradients for model parameters from main loss only
+                model_params = list(model.parameters())
+                model_grads = torch.autograd.grad(
+                    loss,
+                    model_params,
+                    retain_graph=True,
+                    create_graph=False,
+                    allow_unused=False
+                )
+
+                # Assign model gradients
+                for param, grad in zip(model_params, model_grads):
+                    param.grad = grad
+
+                # Compute gradients for embedding parameters from dispersive loss only
+                embedding_params = list(embedding.parameters())
+                embedding_grads = torch.autograd.grad(
+                    dispersive_loss,
+                    embedding_params,
+                    retain_graph=False,
+                    create_graph=False,
+                    allow_unused=False
+                )
+
+                # Assign embedding gradients
+                for param, grad in zip(embedding_params, embedding_grads):
+                    param.grad = grad
+            else:
+                # No REPAE: normal backward for all parameters
+                loss.backward()
+
+            # Step both optimizers
+            optimizer_model.step()
+            scheduler_model.step()
+
+            if repae:
+                optimizer_embedding.step()
+                scheduler_embedding.step()
 
             total_losses.append(float(loss.detach()))
             recon_losses.append(float(reconst_loss.detach()))
@@ -1066,11 +1219,12 @@ def main(**args):
                 writer.add_scalar('Loss/dispersion', dispersive_loss.item(), step)
                 writer.add_scalar('Loss/diffusion_mean', total_diffusion, step)
                 writer.add_scalar('Metrics/accuracy_t0', acc, step)
-                writer.add_scalar('Hyperparameters/learning_rate', scheduler.get_last_lr()[0], step)
+                writer.add_scalar('Hyperparameters/learning_rate_model', scheduler_model.get_last_lr()[0], step)
+                writer.add_scalar('Hyperparameters/learning_rate_embedding', scheduler_embedding.get_last_lr()[0], step)
 
                 # Log embeddings periodically
                 if step % (print_freq * 10) == 0:
-                    emb_matrix = embedding().detach().cpu()
+                    emb_matrix = get_embedding_matrix().detach().cpu()
                     writer.add_embedding(
                         emb_matrix,
                         metadata=[str(i) for i in range(vocab_size)],
@@ -1086,7 +1240,7 @@ def main(**args):
                             if param.grad is not None:
                                 writer.add_histogram(f'Model/{name}.grad', param.grad, step)
 
-                print(embedding())
+                print(get_embedding_matrix())
                 print(f"{step:>6} | recon={reconst_val:.4f} diff_tail={diff_tail_val:.4f} prior={prior_loss.item():.4f} "
                       f"loss={loss.item():.4f} (diff_mean={total_diffusion:.4f}) disp_loss={dispersive_loss:.4f} acc={acc:.4f}")
 
@@ -1108,7 +1262,7 @@ def main(**args):
                     sqrt_alpha_start = torch.sqrt(alpha_start)
                     # Start from pure noise
                     z = torch.randn(n_samples, seq_len, embed_dim, device=device) * sqrt_one_minus_alpha_start
-                    embedding_matrix = embedding()
+                    embedding_matrix = get_embedding_matrix()
 
                     # Load test quiz data for guided sampling
                     test_quiz = None
@@ -1358,10 +1512,19 @@ def main(**args):
             checkpoint_dir = os.path.dirname(checkpoint_path)
             if checkpoint_dir:
                 os.makedirs(checkpoint_dir, exist_ok=True)
+
+            # Save model and embedding state_dicts
+            embedding_state = embedding.state_dict()
+            model_state = model.state_dict()
+
             torch.save(
                 {
-                    'embedding_state_dict': embedding.state_dict(),
-                    'model_state_dict': model.state_dict(),
+                    'embedding_state_dict': embedding_state,
+                    'model_state_dict': model_state,
+                    'optimizer_model_state_dict': optimizer_model.state_dict(),
+                    'optimizer_embedding_state_dict': optimizer_embedding.state_dict(),
+                    'scheduler_model_state_dict': scheduler_model.state_dict(),
+                    'scheduler_embedding_state_dict': scheduler_embedding.state_dict(),
                     'config': {
                         'embed_dim': embed_dim,
                         'hidden_dim': hidden_dim,
@@ -1372,6 +1535,7 @@ def main(**args):
                         'positional_encoding': positional_encoding,
                         'embedding_type': embedding_type,
                         'transformer_block_type': transformer_block_type,
+                        'enable_repae': repae,
                     },
                 },
                 checkpoint_path
@@ -1500,7 +1664,7 @@ def main(**args):
                 raise Exception
             accuracy = all_correct / total_tokens
             print(f"Overall Accuracy: {accuracy:.2%} ({all_correct}/{total_tokens} tokens correct)")
-            print(embedding())
+            print(get_embedding_matrix())
 
             # TensorBoard logging for final evaluation
             writer.add_scalar('Evaluation/final_accuracy', accuracy * 100, steps)
@@ -1515,7 +1679,7 @@ def main(**args):
             writer.add_hparams(hparams, metric_dict)
 
             # Log embedding visualization
-            visualize_embeddings(embedding(), embed_plot_path)
+            visualize_embeddings(get_embedding_matrix(), embed_plot_path)
             if os.path.exists(embed_plot_path):
                 try:
                     import matplotlib.pyplot as plt
@@ -1582,7 +1746,7 @@ def main(**args):
             sqrt_alpha_start = torch.sqrt(alpha_start)
             # Start from pure noise
             z = torch.randn(n_samples, seq_len, embed_dim, device=device) * sqrt_one_minus_alpha_start
-            embedding_matrix = embedding()
+            embedding_matrix = get_embedding_matrix()
 
             # Load test quiz data for guided sampling
             test_quiz = None
