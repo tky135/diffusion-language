@@ -1,10 +1,8 @@
 """
 
 Datasets supported:
-- simple:        sequences length 4, [i, i+1, i+2, i+3] [~100%]
-- sudoku:        full Sudoku solutions [0%]
-- sudoku_simple: first row  [93.40%] python main.py --dataset sudoku_simple --lr 1e-3 --batch_size 512 --steps 60000 --lr_warmup_steps 5000 --positional_encoding sinusoidal --embed_dim 2
-- sudoku_tiny:   all permutations of {0,1,2,3} [99.2%]
+- sequential:    sequences length 4, [i, i+1, i+2, i+3] [~100%]
+- sudoku:        full Sudoku solutions (9x9 grids)
 """
 
 import fire
@@ -18,7 +16,6 @@ import shutil
 import glob
 from datetime import datetime
 from typing import Dict, List, Optional
-from itertools import permutations
 from torch.utils.tensorboard import SummaryWriter
 from einops import rearrange
 from lib import ops as lib_ops
@@ -256,15 +253,6 @@ def create_simple_dataset():
     print(f"Dataset (first 5 rows):\n{data[:5]}")
     return data
 
-def create_randpair_dataset():
-    data = []
-    for i in range(10):
-        for j in range(10):
-            data.append([i, (i + 1) % 10, j, (j + 1) % 10])
-    data = torch.tensor(data, dtype=torch.int64)
-    print(f"[simple] Dataset shape: {data.shape}")
-    print(f"Dataset (first 5 rows):\n{data[:5]}")
-    return data
 def load_sudoku_dataset(csv_path):
     """
     Load Sudoku dataset from CSV file.
@@ -306,34 +294,6 @@ def load_sudoku_dataset(csv_path):
         return quiz_data, data
     else:
         return data
-
-
-def load_sudoku_first_row_dataset(csv_path: str) -> torch.Tensor:
-    """
-    Load only the first row (9 digits) from each Sudoku solution.
-    Returns shape [N, 9], values 1..9.
-    """
-    full = load_sudoku_dataset(csv_path)  # [N, 81]
-    rows = full[:, :9].contiguous()       # first 9 digits = first row
-    print(f"[sudoku_simple] Using only first row: shape {rows.shape}")
-    return rows
-
-
-def create_sudoku_tiny_dataset(repeat: int = 1, shuffle: bool = True) -> torch.Tensor:
-    """
-    Tiny 'sudoku' dataset: every sequence is a permutation of {0,1,2,3}.
-    Returns shape [24*repeat, 4].
-    """
-    base = list(permutations([0, 1, 2, 3], 4))  # 24 tuples
-    data = torch.tensor(base, dtype=torch.int64)
-    if repeat > 1:
-        data = data.repeat(repeat, 1)
-    if shuffle:
-        idx = torch.randperm(len(data))
-        data = data[idx]
-    print(f"[sudoku_tiny] Dataset shape: {data.shape} (24 perms x repeat={repeat})")
-    print(data[:8])
-    return data
 
 
 class EmbeddingMatrix(nn.Module):
@@ -774,27 +734,6 @@ def main(**args):
             data = load_sudoku_dataset(sudoku_train_path)
             test_quiz, test_data = load_sudoku_dataset(sudoku_test_path)
 
-    elif dataset_type == 'sudoku_simple':
-        # Only the first row (9 digits) from each Sudoku solution
-        vocab_size = 10
-        seq_len = 9
-        data = None
-        test_data = None
-        if not sampling_only:
-            data = load_sudoku_first_row_dataset(sudoku_train_path)   # [N, 9]
-            test_data = load_sudoku_first_row_dataset(sudoku_test_path)
-
-    elif dataset_type == 'sudoku_tiny':
-        # Permutations of {0,1,2,3}: seq_len=4, vocab_size=4
-        vocab_size = 4
-        seq_len = 4
-        data = None
-        test_data = None
-        if not sampling_only:
-            tiny_repeat = int(args.get('tiny_repeat', 1))   # optional oversampling
-            data = create_sudoku_tiny_dataset(repeat=tiny_repeat, shuffle=True)
-            test_data = data.clone()
-
     elif dataset_type == 'sequential':
         # original 4-token toy sequence
         vocab_size = 10
@@ -804,11 +743,6 @@ def main(**args):
         if not sampling_only:
             data = create_simple_dataset()
 
-    elif dataset_type == 'randompair':
-        vocab_size = 10
-        seq_len = 4
-        data = create_randpair_dataset()
-        
     else:
         raise Exception
 
@@ -1348,18 +1282,6 @@ def main(**args):
                             sample_text.append(f"Sample {i+1}:\n{grid_str}\n")
                             print()
 
-                    elif dataset_type == 'sudoku_simple':
-                        for i in range(min(20, n_samples)):
-                            sample_str = f"Sample {i+1} (row): {final_preds[i].tolist()}"
-                            print(f"  {sample_str}")
-                            sample_text.append(sample_str)
-
-                    elif dataset_type == 'sudoku_tiny':
-                        for i in range(min(30, n_samples)):
-                            sample_str = f"Sample {i+1}: {final_preds[i].tolist()}"
-                            print(f"  {sample_str}")
-                            sample_text.append(sample_str)
-
                     else:
                         for i in range(min(50, n_samples)):
                             sample_str = f"Sample {i+1}: {final_preds[i].tolist()}"
@@ -1430,54 +1352,6 @@ def main(**args):
                         writer.add_scalar('Sampling/score', avg_score, step)
                         writer.add_scalar('Sampling/valid_count', valid_count, step)
 
-                    elif dataset_type == 'sudoku_simple':
-                        # Valid Sudoku row: digits 1..9 exactly once
-                        valid = []
-                        target_set = set(range(1, 10))
-                        for i in range(n_samples):
-                            row = final_preds[i].tolist()
-                            is_valid = (len(row) == 9) and (set(row) == target_set)
-                            valid.append(is_valid)
-                        valid_count = sum(valid)
-                        print(f"\nValid Sudoku first rows: {valid_count}/{n_samples}")
-                        accuracy_pct = 100.0 * valid_count / n_samples if n_samples > 0 else 0.0
-                        print(f"Sampling accuracy (row uniqueness 1..9): {accuracy_pct:.2f}%")
-
-                        # TensorBoard logging
-                        writer.add_scalar('Sampling/accuracy', accuracy_pct, step)
-                        writer.add_scalar('Sampling/valid_count', valid_count, step)
-
-                    elif dataset_type == 'sudoku_tiny':
-                        # Valid row = permutation of {0,1,2,3}
-                        target = set([0, 1, 2, 3])
-                        valid = []
-                        for i in range(n_samples):
-                            row = final_preds[i].tolist()
-                            is_perm = (len(row) == 4) and (set(row) == target) and (len(set(row)) == 4)
-                            valid.append(is_perm)
-                        valid_count = sum(valid)
-                        print(f"\nValid permutations: {valid_count}/{n_samples}")
-                        accuracy_pct = 100.0 * valid_count / n_samples if n_samples > 0 else 0.0
-                        print(f"Sampling accuracy (perm of 0..3): {accuracy_pct:.2f}%")
-
-                        # TensorBoard logging
-                        writer.add_scalar('Sampling/accuracy', accuracy_pct, step)
-                        writer.add_scalar('Sampling/valid_count', valid_count, step)
-                    elif dataset_type == 'randompair':
-                        valid_patterns = []
-                        for i in range(n_samples):
-                            seq = final_preds[i].tolist()
-                            is_sequential = (seq[1] == (seq[0] + 1) % 10) and (seq[3] == (seq[2] + 1) % 10)
-                            valid_patterns.append(is_sequential)
-
-                        valid_count = sum(valid_patterns)
-                        print(f"\nValid sequential patterns: {valid_count}/{n_samples}")
-                        accuracy_pct = 100.0 * valid_count / n_samples if n_samples > 0 else 0.0
-                        print(f"Sampling accuracy: {accuracy_pct:.2f}%")
-
-                        # TensorBoard logging
-                        writer.add_scalar('Sampling/accuracy', accuracy_pct, step)
-                        writer.add_scalar('Sampling/valid_count', valid_count, step)
                     elif dataset_type == 'sequential':
                         # Original sequential pattern check
                         valid_patterns = []
@@ -1579,55 +1453,6 @@ def main(**args):
                     print(f"Predicted:\n{preds.reshape(9, 9)}")
                     print(f"Correct digits: {correct}/{seq.shape[1]}\n")
 
-            elif dataset_type == 'sudoku_simple':
-                # First-row-only evaluation (9 digits)
-                num_test_samples = min(10, len(test_data))
-                test_indices = torch.randperm(len(test_data))[:num_test_samples]
-
-                for idx in test_indices:
-                    seq = test_data[idx:idx+1].to(device)           # [1, 9]
-                    x_embed = embedding(seq)
-
-                    t_test = torch.tensor([0], dtype=torch.long, device=device)
-                    sqrt_alpha_test = sqrt_alphas_cumprod[t_test][:, None, None]
-                    z_test = sqrt_alpha_test * x_embed
-                    t_test_continuous = t_test.float() / denom
-
-                    logits = model(z_test, t_test_continuous)
-                    preds = logits[0].argmax(dim=-1)
-
-                    correct = (preds == seq[0]).sum().item()
-                    all_correct += correct
-                    total_tokens += seq.shape[1]
-
-                    print(f"Test sample {idx.item()} first row:")
-                    print(f"Ground truth: {seq[0].tolist()}")
-                    print(f"Predicted   : {preds.tolist()}")
-                    print(f"Correct digits: {correct}/{seq.shape[1]}\n")
-
-            elif dataset_type == 'sudoku_tiny':
-                # Evaluate on the tiny set (up to 24 rows)
-                num_test = min(len(test_data), 24)
-                for i in range(num_test):
-                    seq = test_data[i:i+1].to(device)  # [1, 4]
-                    x_embed = embedding(seq)
-
-                    t_test = torch.tensor([0], dtype=torch.long, device=device)
-                    sqrt_alpha_test = sqrt_alphas_cumprod[t_test][:, None, None]
-                    z_test = sqrt_alpha_test * x_embed
-                    t_test_continuous = t_test.float() / denom
-
-                    logits = model(z_test, t_test_continuous)
-                    preds = logits[0].argmax(dim=-1)
-
-                    correct = (preds == seq[0]).sum().item()
-                    all_correct += correct
-                    total_tokens += seq.shape[1]
-
-                    print(f"GT: {seq[0].tolist()}  |  Pred: {preds.tolist()}  |  correct {correct}/4")
-
-            elif dataset_type == 'randompair':
-                pass
             elif dataset_type == 'sequential':
                 # Original 4-digit evaluation
                 for i in range(10):
@@ -1827,14 +1652,6 @@ def main(**args):
                     print(final_preds[i].reshape(9, 9))
                     print()
 
-            elif dataset_type == 'sudoku_simple':
-                for i in range(min(20, n_samples)):
-                    print(f"  Sample {i+1} (row): {final_preds[i].tolist()}")
-
-            elif dataset_type == 'sudoku_tiny':
-                for i in range(min(30, n_samples)):
-                    print(f"  Sample {i+1}: {final_preds[i].tolist()}")
-
             else:
                 for i in range(min(50, n_samples)):
                     print(f"  Sample {i+1}: {final_preds[i].tolist()}")
@@ -1893,42 +1710,6 @@ def main(**args):
                 print(f"Sampling accuracy: {accuracy_pct:.2f}%")
                 print(f"Sampling score: ", np.mean(score_list))
 
-            elif dataset_type == 'sudoku_simple':
-                # Valid Sudoku row: digits 1..9 exactly once
-                valid = []
-                target_set = set(range(1, 10))
-                for i in range(n_samples):
-                    row = final_preds[i].tolist()
-                    is_valid = (len(row) == 9) and (set(row) == target_set)
-                    valid.append(is_valid)
-                valid_count = sum(valid)
-                print(f"\nValid Sudoku first rows: {valid_count}/{n_samples}")
-                accuracy_pct = 100.0 * valid_count / n_samples if n_samples > 0 else 0.0
-                print(f"Sampling accuracy (row uniqueness 1..9): {accuracy_pct:.2f}%")
-
-            elif dataset_type == 'sudoku_tiny':
-                # Valid row = permutation of {0,1,2,3}
-                target = set([0, 1, 2, 3])
-                valid = []
-                for i in range(n_samples):
-                    row = final_preds[i].tolist()
-                    is_perm = (len(row) == 4) and (set(row) == target) and (len(set(row)) == 4)
-                    valid.append(is_perm)
-                valid_count = sum(valid)
-                print(f"\nValid permutations: {valid_count}/{n_samples}")
-                accuracy_pct = 100.0 * valid_count / n_samples if n_samples > 0 else 0.0
-                print(f"Sampling accuracy (perm of 0..3): {accuracy_pct:.2f}%")
-            elif dataset_type == 'randompair':
-                valid_patterns = []
-                for i in range(n_samples):
-                    seq = final_preds[i].tolist()
-                    is_sequential = (seq[1] == (seq[0] + 1) % 10) and (seq[3] == (seq[2] + 1) % 10)
-                    valid_patterns.append(is_sequential)
-
-                valid_count = sum(valid_patterns)
-                print(f"\nValid sequential patterns: {valid_count}/{n_samples}")
-                accuracy_pct = 100.0 * valid_count / n_samples if n_samples > 0 else 0.0
-                print(f"Sampling accuracy: {accuracy_pct:.2f}%")
             elif dataset_type == 'sequential':
                 # Original sequential pattern check
                 valid_patterns = []
