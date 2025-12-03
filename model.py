@@ -26,6 +26,7 @@ __all__ = [
     "SimpleTransformerBlock",
     "GPT2Block",
     "SimpleDiffusionModel",
+    "CCDDModel",
 ]
 
 
@@ -48,7 +49,7 @@ def llada_mask(x0: torch.Tensor, t: torch.Tensor, mask_index: int):
     return xt
 
 
-def add_gumbel_noise(logits: torch.Tensor, temperature: float = 1.0):
+def add_gumbel_noise(logits: torch.Tensor, temperature: float = 0.0):
     """
     Add Gumbel noise to logits for sampling.
 
@@ -112,6 +113,7 @@ class MaskedPredictor(nn.Module):
         positional_encoding="learned",
         dataset_type="sequential",
         transformer_block_type="simple",
+        combine_method="add",  # 'add' or 'concat'
         **kwargs,
     ):
         super().__init__()
@@ -123,6 +125,7 @@ class MaskedPredictor(nn.Module):
         self.positional_encoding = positional_encoding.lower()
         self.dataset_type = dataset_type.lower()
         self.transformer_block_type = transformer_block_type.lower()
+        self.combine_method = combine_method.lower()
 
         # Validate transformer block type
         if self.transformer_block_type not in ["simple", "gpt2"]:
@@ -130,11 +133,19 @@ class MaskedPredictor(nn.Module):
                 f"transformer_block_type must be 'simple' or 'gpt2', got '{transformer_block_type}'"
             )
 
+        # Validate combine method
+        if self.combine_method not in ["add", "concat"]:
+            raise ValueError(
+                f"combine_method must be 'add' or 'concat', got '{combine_method}'"
+            )
+
         # Token embedding (+1 for mask token)
         self.embed = nn.Embedding(vocab_size + 1, embed_dim)
 
-        # Project embedding to hidden dimension (same as SimpleDiffusionModel)
-        self.input_proj = nn.Linear(embed_dim, self.hidden_dim, bias=False)
+        # Project embedding to hidden dimension
+        # For concat mode, input is 2*embed_dim; for add mode, input is embed_dim
+        input_dim = 2 * embed_dim if self.combine_method == 'concat' else embed_dim
+        self.input_proj = nn.Linear(input_dim, self.hidden_dim, bias=False)
 
         # Positional embeddings (same options as SimpleDiffusionModel)
         if self.dataset_type == "sudoku" and self.positional_encoding == "sinusoidal":
@@ -150,8 +161,13 @@ class MaskedPredictor(nn.Module):
         else:
             raise ValueError(f"Unknown positional_encoding '{positional_encoding}'")
 
-        # Time embedding (for masking probability t)
-        self.time_mlp = nn.Sequential(
+        # Time embeddings: separate MLPs for discrete and continuous time
+        self.time_mlp_disc = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
+        self.time_mlp_cont = nn.Sequential(
             nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.GELU(),
             nn.Linear(self.hidden_dim, self.hidden_dim),
@@ -196,20 +212,33 @@ class MaskedPredictor(nn.Module):
             emb = F.pad(emb, (0, 1), mode="constant", value=0)
         return emb
 
-    def forward(self, xt, x0, t):
+    def forward_emb2logits(self, xt, t_disc, t_cont=None):
         """
-        Forward pass for training - using SAME architecture as SimpleDiffusionModel.
+        Forward pass without computing loss (for generation).
 
         Args:
-            xt: Masked tokens [B, L]
-            x0: Original tokens [B, L]
-            t: Masking probability [B]
+            xt: Token sequence [B, L]
+            t_disc: Discrete time value [B] or scalar (defaults to 0.5)
+            t_cont: Continuous time value [B] or scalar (optional, defaults to t_disc)
 
         Returns:
-            loss: Cross-entropy loss on masked positions
+            logits: [B, L, vocab_size]
         """
+        B = xt.shape[0]
+        if t_disc is None:
+            t_disc = torch.full((B,), 0.5, device=xt.device)
+        elif isinstance(t_disc, float):
+            t_disc = torch.full((B,), t_disc, device=xt.device)
+
+        # Backward compatibility: if t_cont is None, use t_disc
+        if t_cont is None:
+            t_cont = t_disc
+        elif isinstance(t_cont, float):
+            t_cont = torch.full((B,), t_cont, device=xt.device)
+
         # Token embedding
-        x = self.embed(xt)  # [B, L, embed_dim]
+        # x = self.embed(xt)  # [B, L, embed_dim]
+        x = xt
 
         # Project to hidden dimension
         x = self.input_proj(x)  # [B, L, hidden_dim]
@@ -217,9 +246,44 @@ class MaskedPredictor(nn.Module):
         # Add positional encoding
         x = x + self.pos_embedding  # [B, L, hidden_dim]
 
-        # Add time embedding (masking probability)
-        t_emb = self._get_sinusoidal_time_embedding(t, self.hidden_dim)  # [B, hidden_dim]
-        t_emb = self.time_mlp(t_emb)  # [B, hidden_dim]
+        # Add dual time embeddings (discrete and continuous)
+        t_disc_emb = self._get_sinusoidal_time_embedding(t_disc, self.hidden_dim)  # [B, hidden_dim]
+        t_cont_emb = self._get_sinusoidal_time_embedding(t_cont, self.hidden_dim)  # [B, hidden_dim]
+        # Process through separate MLPs (different learnable projections)
+        t_disc_emb = self.time_mlp_disc(t_disc_emb)  # [B, hidden_dim]
+        t_cont_emb = self.time_mlp_cont(t_cont_emb)  # [B, hidden_dim]
+        # Add embeddings together
+        t_emb = t_disc_emb + t_cont_emb  # [B, hidden_dim]
+        x = x + t_emb.unsqueeze(1)  # [B, L, hidden_dim]
+
+        # Pass through transformer blocks
+        for block in self.blocks:
+            x = block(x)
+
+        # Output projection
+        x = self.norm_out(x)
+        logits = self.output_layer(x)  # [B, L, vocab_size]
+
+        return logits
+    def forward_emb2loss(self, x, xt, x0, t_disc, t_cont=None):
+        # Backward compatibility: if t_cont is None, use t_disc
+        if t_cont is None:
+            t_cont = t_disc
+
+        # Project to hidden dimension
+        x = self.input_proj(x)  # [B, L, hidden_dim]
+
+        # Add positional encoding
+        x = x + self.pos_embedding  # [B, L, hidden_dim]
+
+        # Add dual time embeddings (discrete and continuous)
+        t_disc_emb = self._get_sinusoidal_time_embedding(t_disc, self.hidden_dim)  # [B, hidden_dim]
+        t_cont_emb = self._get_sinusoidal_time_embedding(t_cont, self.hidden_dim)  # [B, hidden_dim]
+        # Process through separate MLPs (different learnable projections)
+        t_disc_emb = self.time_mlp_disc(t_disc_emb)  # [B, hidden_dim]
+        t_cont_emb = self.time_mlp_cont(t_cont_emb)  # [B, hidden_dim]
+        # Add embeddings together
+        t_emb = t_disc_emb + t_cont_emb  # [B, hidden_dim]
         x = x + t_emb.unsqueeze(1)  # [B, L, hidden_dim]
 
         # Pass through transformer blocks (same as SimpleDiffusionModel)
@@ -235,28 +299,27 @@ class MaskedPredictor(nn.Module):
         logits_masked = logits[mask]
         targets_masked = x0[mask]
 
-        # Weight by inverse of masking probability
-        t_weight = (1.0 / (t + 1e-8)).view(-1, 1).expand_as(xt)[mask]
+        # Weight by inverse of masking probability (use t_disc)
+        t_weight = torch.ones_like((1.0 / (t_disc + 1e-8)).view(-1, 1).expand_as(xt)[mask])
         loss = (F.cross_entropy(logits_masked, targets_masked, reduction="none") * t_weight).mean()
 
         return loss
-
-    def _forward_without_loss(self, xt, t=None):
+    def forward(self, xt, x0, t_disc, t_cont=None):
         """
-        Forward pass without computing loss (for generation).
+        Forward pass for training - using SAME architecture as SimpleDiffusionModel.
 
         Args:
-            xt: Token sequence [B, L]
-            t: Optional time value [B] or scalar (defaults to 0.5)
+            xt: Masked tokens [B, L]
+            x0: Original tokens [B, L]
+            t_disc: Discrete masking probability [B]
+            t_cont: Continuous noise time [B] (optional, defaults to t_disc)
 
         Returns:
-            logits: [B, L, vocab_size]
+            loss: Cross-entropy loss on masked positions
         """
-        B = xt.shape[0]
-        if t is None:
-            t = torch.full((B,), 0.5, device=xt.device)
-        elif isinstance(t, float):
-            t = torch.full((B,), t, device=xt.device)
+        # Backward compatibility: if t_cont is None, use t_disc
+        if t_cont is None:
+            t_cont = t_disc
 
         # Token embedding
         x = self.embed(xt)  # [B, L, embed_dim]
@@ -267,9 +330,76 @@ class MaskedPredictor(nn.Module):
         # Add positional encoding
         x = x + self.pos_embedding  # [B, L, hidden_dim]
 
-        # Add time embedding
-        t_emb = self._get_sinusoidal_time_embedding(t, self.hidden_dim)  # [B, hidden_dim]
-        t_emb = self.time_mlp(t_emb)  # [B, hidden_dim]
+        # Add dual time embeddings (discrete and continuous)
+        t_disc_emb = self._get_sinusoidal_time_embedding(t_disc, self.hidden_dim)  # [B, hidden_dim]
+        t_cont_emb = self._get_sinusoidal_time_embedding(t_cont, self.hidden_dim)  # [B, hidden_dim]
+        # Process through separate MLPs (different learnable projections)
+        t_disc_emb = self.time_mlp_disc(t_disc_emb)  # [B, hidden_dim]
+        t_cont_emb = self.time_mlp_cont(t_cont_emb)  # [B, hidden_dim]
+        # Add embeddings together
+        t_emb = t_disc_emb + t_cont_emb  # [B, hidden_dim]
+        x = x + t_emb.unsqueeze(1)  # [B, L, hidden_dim]
+
+        # Pass through transformer blocks (same as SimpleDiffusionModel)
+        for block in self.blocks:
+            x = block(x)
+
+        # Output projection
+        x = self.norm_out(x)
+        logits = self.output_layer(x)  # [B, L, vocab_size]
+
+        # Compute loss only on masked positions
+        mask = xt == self.mask_index
+        logits_masked = logits[mask]
+        targets_masked = x0[mask]
+
+        # Weight by inverse of masking probability (use t_disc)
+        t_weight = (1.0 / (t_disc + 1e-8)).view(-1, 1).expand_as(xt)[mask]
+        loss = (F.cross_entropy(logits_masked, targets_masked, reduction="none") * t_weight).mean()
+
+        return loss
+
+    def _forward_without_loss(self, xt, t_disc=None, t_cont=None):
+        """
+        Forward pass without computing loss (for generation).
+
+        Args:
+            xt: Token sequence [B, L]
+            t_disc: Optional discrete time value [B] or scalar (defaults to 0.5)
+            t_cont: Optional continuous time value [B] or scalar (defaults to t_disc)
+
+        Returns:
+            logits: [B, L, vocab_size]
+        """
+        B = xt.shape[0]
+        if t_disc is None:
+            t_disc = torch.full((B,), 0.5, device=xt.device)
+        elif isinstance(t_disc, float):
+            t_disc = torch.full((B,), t_disc, device=xt.device)
+
+        # Backward compatibility: if t_cont is None, use t_disc
+        if t_cont is None:
+            t_cont = t_disc
+        elif isinstance(t_cont, float):
+            t_cont = torch.full((B,), t_cont, device=xt.device)
+
+        # Token embedding
+        x = self.embed(xt)  # [B, L, embed_dim]
+
+        # Project to hidden dimension
+        x = self.input_proj(x)  # [B, L, hidden_dim]
+
+        # Add positional encoding
+        x = x + self.pos_embedding  # [B, L, hidden_dim]
+
+        # Add dual time embeddings (discrete and continuous)
+        t_disc_emb = self._get_sinusoidal_time_embedding(t_disc, self.hidden_dim)  # [B, hidden_dim]
+        t_cont_emb = self._get_sinusoidal_time_embedding(t_cont, self.hidden_dim)  # [B, hidden_dim]
+        # Process through separate MLPs (different learnable projections)
+        t_disc_emb = self.time_mlp_disc(t_disc_emb)  # [B, hidden_dim]
+        t_cont_emb = self.time_mlp_cont(t_cont_emb)  # [B, hidden_dim]
+        # Add embeddings together
+        t_emb = t_disc_emb + t_cont_emb  # [B, hidden_dim]
         x = x + t_emb.unsqueeze(1)  # [B, L, hidden_dim]
 
         # Pass through transformer blocks
@@ -304,9 +434,9 @@ class MaskedPredictor(nn.Module):
 
         for i in range(steps):
             # Get model predictions using new architecture
-            # Time value decreases from 0.9 to 0.1 as we unmask
-            t_val = 0.9 - (i / max(steps - 1, 1)) * 0.8
-            logits = self._forward_without_loss(xt, t=t_val)
+            # Time value decreases from 1.0 to 0.0 as we unmask
+            t_val = 1.0 - (i / max(steps - 1, 1)) * 1.0
+            logits = self._forward_without_loss(xt, t_disc=t_val, t_cont=t_val)
 
             # Sample with Gumbel noise
             logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
@@ -362,8 +492,8 @@ class MaskedPredictor(nn.Module):
                 break
 
             # Get predictions using new architecture
-            t_val = 0.9 - (step / max(L - 1, 1)) * 0.8
-            logits = self._forward_without_loss(xt, t=t_val)
+            t_val = 1.0 - (step / max(L - 1, 1)) * 1.0
+            logits = self._forward_without_loss(xt, t_disc=t_val, t_cont=t_val)
             preds = logits.argmax(dim=-1)
 
             # Sample one masked position per batch element
@@ -741,6 +871,164 @@ class SimpleDiffusionModel(nn.Module):
     def clear_layer_activations(self):
         """Clear the stored layer activations to free memory."""
         self.layer_activations = []
+
+    def get_num_layers(self):
+        """Return the number of transformer blocks."""
+        return len(self.blocks)
+
+
+class CCDDModel(nn.Module):
+    """
+    Continuous-Categorical Dual Diffusion (CCDD) Model.
+
+    Takes both discrete tokens (x_t) and continuous latents (z_t) as input,
+    and outputs two predictions:
+    - epsilon_theta: noise prediction for continuous latent [B, L, latent_dim]
+    - logits_theta: token logits for discrete sequence [B, L, vocab_size]
+
+    Both diffusion processes are coupled through a shared transformer backbone.
+    """
+
+    def __init__(
+        self,
+        vocab_size,
+        seq_len,
+        latent_dim=64,
+        embed_dim=64,
+        hidden_dim=None,
+        n_heads=2,
+        n_layers=4,
+        positional_encoding="learned",
+        dataset_type="sequential",
+        transformer_block_type="simple",
+        **kwargs,
+    ):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.seq_len = seq_len
+        self.latent_dim = latent_dim
+        self.embed_dim = embed_dim
+        self.hidden_dim = hidden_dim if hidden_dim is not None else embed_dim
+        self.positional_encoding = positional_encoding.lower()
+        self.dataset_type = dataset_type.lower()
+        self.transformer_block_type = transformer_block_type.lower()
+
+        # Mask token index
+        self.mask_index = vocab_size
+
+        # Validate transformer block type
+        if self.transformer_block_type not in ["simple", "gpt2"]:
+            raise ValueError(
+                f"transformer_block_type must be 'simple' or 'gpt2', got '{transformer_block_type}'"
+            )
+
+        # Token embedding (+1 for mask token in discrete process)
+        self.token_embed = nn.Embedding(vocab_size + 1, embed_dim)
+
+        # Project both continuous latent and discrete embedding to hidden dimension
+        # Input: concatenation of [z_t, embed(x_t)]
+        self.input_proj = nn.Linear(latent_dim + embed_dim, self.hidden_dim, bias=False)
+
+        # Positional embeddings
+        if self.dataset_type == "sudoku" and self.positional_encoding == "sinusoidal":
+            pe = SimpleDiffusionModel._build_2d_sinusoidal_embedding(9, 9, self.hidden_dim)
+            self.register_buffer("pos_embedding", pe, persistent=False)
+        elif self.positional_encoding == "learned":
+            self.pos_embedding = nn.Parameter(torch.zeros(1, seq_len, self.hidden_dim))
+            nn.init.normal_(self.pos_embedding, mean=0.0, std=0.02)
+        elif self.positional_encoding == "sinusoidal":
+            pe = SimpleDiffusionModel._build_sinusoidal_embedding(seq_len, self.hidden_dim)
+            self.register_buffer("pos_embedding", pe, persistent=False)
+        else:
+            raise ValueError(f"Unknown positional_encoding '{positional_encoding}'")
+
+        # Time embedding (single time variable for both processes)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
+
+        # Transformer blocks
+        if self.transformer_block_type == "simple":
+            self.blocks = nn.ModuleList(
+                [SimpleTransformerBlock(self.hidden_dim, n_heads) for _ in range(n_layers)]
+            )
+        elif self.transformer_block_type == "gpt2":
+            self.blocks = nn.ModuleList(
+                [
+                    GPT2Block(
+                        hidden_size=self.hidden_dim,
+                        num_attention_heads=n_heads,
+                        intermediate_size=4 * self.hidden_dim,
+                        layer_norm_epsilon=1e-5,
+                        attn_pdrop=0.0,
+                        resid_pdrop=0.1,
+                    )
+                    for _ in range(n_layers)
+                ]
+            )
+
+        # Output projection - layer norm
+        self.norm_out = nn.LayerNorm(self.hidden_dim)
+
+        # Two output heads
+        self.epsilon_head = nn.Linear(self.hidden_dim, latent_dim, bias=True)  # Noise prediction
+        self.logits_head = nn.Linear(self.hidden_dim, vocab_size, bias=True)   # Token logits
+
+    def _get_sinusoidal_time_embedding(self, t: torch.Tensor, dim: int) -> torch.Tensor:
+        """Generate sinusoidal time embeddings."""
+        half_dim = dim // 2
+        emb = math.log(10000) / max(half_dim - 1, 1)
+        emb = torch.exp(torch.arange(half_dim, device=t.device, dtype=torch.float32) * -emb)
+        emb = t[:, None].float() * emb[None, :]
+        emb = torch.cat([emb.sin(), emb.cos()], dim=-1)
+        if dim % 2 == 1:
+            emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)
+        return emb
+
+    def forward(self, x_t, z_t, t):
+        """
+        Forward pass through the CCDD model.
+
+        Args:
+            x_t: Discrete tokens [B, L] (can contain mask tokens)
+            z_t: Continuous latent [B, L, latent_dim]
+            t: Time variable [B] in range [0, 1]
+
+        Returns:
+            epsilon_pred: Predicted noise [B, L, latent_dim]
+            logits_pred: Predicted token logits [B, L, vocab_size]
+        """
+        # Embed discrete tokens
+        x_embed = self.token_embed(x_t)  # [B, L, embed_dim]
+
+        # Concatenate continuous and discrete representations
+        combined = torch.cat([z_t, x_embed], dim=-1)  # [B, L, latent_dim + embed_dim]
+
+        # Project to hidden dimension
+        h = self.input_proj(combined)  # [B, L, hidden_dim]
+
+        # Add positional encoding
+        h = h + self.pos_embedding  # [B, L, hidden_dim]
+
+        # Add time embedding
+        t_emb = self._get_sinusoidal_time_embedding(t, self.hidden_dim)  # [B, hidden_dim]
+        t_emb = self.time_mlp(t_emb)  # [B, hidden_dim]
+        h = h + t_emb.unsqueeze(1)  # [B, L, hidden_dim]
+
+        # Pass through transformer blocks
+        for block in self.blocks:
+            h = block(h)
+
+        # Normalize
+        h = self.norm_out(h)
+
+        # Two output heads
+        epsilon_pred = self.epsilon_head(h)  # [B, L, latent_dim]
+        logits_pred = self.logits_head(h)    # [B, L, vocab_size]
+
+        return epsilon_pred, logits_pred
 
     def get_num_layers(self):
         """Return the number of transformer blocks."""

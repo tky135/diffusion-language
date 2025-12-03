@@ -23,7 +23,7 @@ def create_simple_dataset():
     return data
 
 
-def load_sudoku_dataset(csv_path: str):
+def load_sudoku_dataset_csv(csv_path: str):
     """
     Load Sudoku dataset from CSV file with columns 'quizzes' and 'solutions'.
 
@@ -41,7 +41,7 @@ def load_sudoku_dataset(csv_path: str):
             solution = [int(c) for c in solution_str]
             solutions.append(solution)
 
-            quiz_str = row['quizzes']
+            quiz_str = row['quizzes'].replace(".", "0")
             quiz = [int(c) for c in quiz_str]
             quizes.append(quiz)
 
