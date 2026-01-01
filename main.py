@@ -8,6 +8,7 @@ Datasets supported:
 Model types supported:
 - continuous:    Continuous diffusion in embedding space (default)
 - masked:        Masked diffusion model (MDM) - simpler discrete approach
+- dva:           Diffusion vs AR masked diffusion with pre-trained GPT2-style model
 - combined:      Combination of continuous + masked diffusion (CADD)
 - ccdd:          Continuous-Categorical Dual Diffusion with separate latents
 
@@ -25,8 +26,14 @@ Usage examples:
   # Masked diffusion on sequential data
   python main.py --dataset sequential --model_type masked --steps 10000
 
-  # Masked diffusion on sudoku
+  # DVA (Diffusion vs AR) masked diffusion on sequential data
+  python main.py --dataset sequential --model_type dva --steps 10000
+
+  # Masked diffusion on sudoku (solution only - default)
   python main.py --dataset sudoku --model_type masked --batch_size 256 --steps 50000
+
+  # Masked diffusion on sudoku with quiz+solution concatenated as input
+  python main.py --dataset sudoku --model_type masked --sudoku_input_type quiz_solution --batch_size 256 --steps 50000
 """
 
 import builtins
@@ -49,14 +56,15 @@ from ipdb import iex
 # Import models and datasets from separate files
 from model import (
     EmbeddingMatrix, OneHotEmbedding, UnitSphereEmbedding,
-    SimpleDiffusionModel, MaskedPredictor, CCDDModel, llada_mask,
+    SimpleDiffusionModel, MaskedPredictor, llada_mask,
     add_gumbel_noise, get_num_transfer_tokens
 )
 from dataset import create_simple_dataset
 # from dataset import load_sudoku_dataset_npy as load_sudoku_dataset
 from dataset import load_sudoku_dataset_csv as load_sudoku_dataset
+from dataset import load_text8_dataset, decode_text8_tokens
 # from dataset import load_sudoku_dataset
-
+from model import dva_model, dva_tokenizer
 
 def setup_experiment_dir(exp_name: Optional[str] = None, base_dir: str = "experiments") -> str:
     """
@@ -346,7 +354,14 @@ def evaluate_sudoku_samples(final_preds, n_samples, mode_str="Sampling"):
     score_list = []
 
     for i in range(n_samples):
-        is_valid, score = is_valid_sudoku(final_preds[i].cpu())
+        # Extract solution portion if in quiz+solution mode
+        if final_preds.shape[1] == 164:
+            # Format: quiz(0-80) + SEP(81) + solution(82-162) + EOF(163)
+            solution = final_preds[i, 82:163]  # Extract solution portion (81 tokens)
+        else:
+            solution = final_preds[i]  # Already just the solution
+
+        is_valid, score = is_valid_sudoku(solution.cpu())
         valid_patterns.append(is_valid)
         score_list.append(score)
 
@@ -399,19 +414,73 @@ def evaluate_sequential_samples(final_preds, n_samples, mode_str="Sampling"):
     }
 
 
+def evaluate_text8_samples(final_preds, n_samples, mode_str="Sampling"):
+    """
+    Evaluate text8 samples - compute space ratio and letter diversity.
+
+    Args:
+        final_preds: Tensor of predicted sequences (n_samples, seq_len)
+        n_samples: Number of samples to evaluate
+        mode_str: String prefix for print statements
+
+    Returns:
+        dict with keys: avg_space_ratio, letter_diversity, unique_chars
+    """
+    space_ratios = []
+    all_chars = []
+
+    for i in range(n_samples):
+        tokens = final_preds[i].cpu().tolist()
+        space_count = sum(1 for t in tokens if t == 26)
+        space_ratios.append(space_count / len(tokens))
+        all_chars.extend(tokens)
+
+    avg_space_ratio = sum(space_ratios) / len(space_ratios) if space_ratios else 0.0
+    unique_chars = len(set(all_chars))
+    letter_diversity = unique_chars / 27.0
+
+    print(f"\n{mode_str} - Space ratio: {avg_space_ratio:.3f}")
+    print(f"{mode_str} - Letter diversity: {letter_diversity:.3f} ({unique_chars}/27)")
+
+    return {
+        'avg_space_ratio': avg_space_ratio,
+        'letter_diversity': letter_diversity,
+        'unique_chars': unique_chars
+    }
+
+
 def display_sudoku_samples(final_preds, n_samples, quiz_data=None, max_display=5):
     """
     Display Sudoku samples (for generation or completion).
 
     Args:
-        final_preds: Tensor of predicted Sudoku grids (n_samples, 81)
+        final_preds: Tensor of predicted Sudoku grids
+            - Shape (n_samples, 81) for solution-only mode
+            - Shape (n_samples, 162) for quiz+solution mode
         n_samples: Total number of samples available
         quiz_data: Optional quiz data for completion mode (n_samples, 81)
         max_display: Maximum number of samples to display
     """
     display_count = min(max_display, n_samples)
 
-    if quiz_data is not None:
+    # Check if predictions are in quiz+solution format (164 tokens with SEP/EOF)
+    if final_preds.shape[1] == 164:
+        # Quiz+solution mode: extract quiz and solution parts
+        # Format: quiz(0-80) + SEP(81) + solution(82-162) + EOF(163)
+        for i in range(display_count):
+            quiz_part = final_preds[i, :81].reshape(9, 9).cpu().numpy()
+            sep_token = final_preds[i, 81].item()
+            solution_part = final_preds[i, 82:163].reshape(9, 9).cpu().numpy()
+            eof_token = final_preds[i, 163].item()
+            print(f"\nSample {i+1}:")
+            print("Quiz (input):        Solution (predicted):")
+            for row_idx in range(9):
+                quiz_row = ' '.join([str(int(v)) if v != 0 else '.' for v in quiz_part[row_idx]])
+                sol_row = ' '.join([str(int(v)) for v in solution_part[row_idx]])
+                print(f"{quiz_row}    {sol_row}")
+            print(f"SEP token: {sep_token}, EOF token: {eof_token}")
+            print()
+    elif quiz_data is not None:
         # Completion mode: show quiz and prediction side by side
         for i in range(display_count):
             quiz_grid = quiz_data[i].reshape(9, 9).cpu().numpy()
@@ -443,6 +512,24 @@ def display_sequential_samples(final_preds, n_samples, max_display=50):
     display_count = min(max_display, n_samples)
     for i in range(display_count):
         print(f"Sample {i+1}: {final_preds[i].tolist()}")
+
+
+def display_text8_samples(final_preds, n_samples, max_display=10):
+    """
+    Display text8 samples (decoded text).
+
+    Args:
+        final_preds: Tensor of predicted sequences (n_samples, seq_len)
+        n_samples: Total number of samples available
+        max_display: Maximum number of samples to display
+    """
+    display_count = min(max_display, n_samples)
+    for i in range(display_count):
+        decoded = decode_text8_tokens(final_preds[i])
+        # Truncate if too long
+        if len(decoded) > 200:
+            decoded = decoded[:200] + "..."
+        print(f"Sample {i+1}: {decoded}")
 
 
 def evaluate_and_display_sudoku(final_preds, n_samples, mode_str, writer=None, step=None,
@@ -478,6 +565,369 @@ def evaluate_and_display_sequential(final_preds, n_samples, mode_str, writer=Non
     return results
 
 
+def evaluate_and_display_text8(final_preds, n_samples, mode_str, writer=None, step=None,
+                                prefix: Optional[str] = None, max_display: int = 10):
+    """
+    Display text8 samples, compute metrics, and optionally log them to TensorBoard.
+    """
+    display_text8_samples(final_preds, n_samples, max_display=max_display)
+    results = evaluate_text8_samples(final_preds, n_samples, mode_str=mode_str)
+
+    if writer is not None and step is not None:
+        metric_prefix = prefix or mode_str.lower()
+        writer.add_scalar(f'Sampling/{metric_prefix}_space_ratio',
+                         results['avg_space_ratio'], step)
+        writer.add_scalar(f'Sampling/{metric_prefix}_letter_diversity',
+                         results['letter_diversity'], step)
+
+    return results
+
+
+def topk_masking_dva(scores, cutoff_len, stochastic=False, temp=1.0):
+    """
+    Helper function for DVA topk decoding (matching trainer.py lines 215-232).
+
+    Args:
+        scores: [b, n] - confidence scores
+        cutoff_len: [b, 1] - number of tokens to keep masked
+        stochastic: bool - whether to add Gumbel noise
+        temp: float - temperature for Gumbel noise
+
+    Returns:
+        mask: [b, n] - True for tokens to keep masked (lowest confidence)
+    """
+    if stochastic:
+        # Add Gumbel noise for stochastic sampling
+        gumbel_noise = -torch.log(-torch.log(torch.rand_like(scores) + 1e-8) + 1e-8)
+        _scores = scores + temp * gumbel_noise
+    else:
+        _scores = scores
+
+    # Sort scores and find cutoff threshold
+    sorted_index = _scores.sort(-1)[0]
+    cutoff = sorted_index.gather(dim=-1, index=cutoff_len)
+
+    # Mask positions with scores below cutoff
+    masking = _scores < cutoff
+    return masking
+
+
+def topk_decoding_dva(x0, x0_scores, decoding_strategy, init_maskable_mask, t, max_step, noise):
+    """
+    Helper function for DVA topk decoding (matching trainer.py lines 235-276).
+
+    Args:
+        x0: [b, n] - predicted tokens
+        x0_scores: [b, n] - confidence scores
+        decoding_strategy: str - "<topk_mode>-<schedule>" (e.g., "stochastic0.5-linear")
+        init_maskable_mask: [b, n] - mask of initially maskable positions
+        t: int - current timestep
+        max_step: int - total number of steps
+        noise: int or Tensor - mask token id or noise values
+
+    Returns:
+        xt: [b, n] - tokens with low-confidence positions masked
+    """
+    # Parse decoding strategy
+    topk_mode, schedule = decoding_strategy.split("-")
+
+    # Compute masking rate (proportion of tokens to keep masked)
+    if schedule == "linear":
+        rate = t / max_step
+    elif schedule == "cosine":
+        rate = np.cos((max_step - t) / max_step * np.pi * 0.5)
+    else:
+        raise NotImplementedError(f"Schedule {schedule} not implemented")
+
+    # Compute cutoff length (number of tokens to keep masked)
+    cutoff_len = (init_maskable_mask.sum(1, keepdim=True) * rate).long()
+
+    # Set scores of non-maskable positions to high value so they won't be selected
+    _scores_for_topk = x0_scores.masked_fill(~init_maskable_mask, 1000.0)
+
+    # Select lowest-confidence tokens to mask
+    if topk_mode.startswith("stochastic"):
+        noise_scale = float(topk_mode.replace("stochastic", ""))
+        lowest_k_mask = topk_masking_dva(_scores_for_topk, cutoff_len, stochastic=True, temp=noise_scale * rate)
+    elif topk_mode == "deterministic":
+        lowest_k_mask = topk_masking_dva(_scores_for_topk, cutoff_len, stochastic=False)
+    else:
+        raise NotImplementedError(f"Topk mode {topk_mode} not implemented")
+
+    # Apply masking: recovered tokens can also be remasked based on current scores
+    if isinstance(noise, torch.Tensor):
+        xt = x0.masked_scatter(lowest_k_mask, noise[lowest_k_mask])
+    elif isinstance(noise, (int, float)):
+        xt = x0.masked_fill(lowest_k_mask, noise)
+    else:
+        raise NotImplementedError("noise should be either a tensor or a scalar")
+
+    return xt
+
+
+def compute_perplexity_text8(model, test_data, model_type, device, batch_size=128, **kwargs):
+    """
+    Compute perplexity on text8 test dataset using ELBO evaluation.
+
+    For masked models: Samples multiple t values and computes ELBO with 1/t weighting on masked positions
+    For continuous models: Samples multiple t values with noise and computes ELBO with SNR weighting (snr_prime)
+    For combined/ccdd models: Evaluates at t=0 (clean reconstruction)
+
+    Perplexity = exp(average negative log-likelihood per token)
+
+    Args:
+        model: The trained model
+        test_data: Test dataset tensor [N, seq_len]
+        model_type: 'masked', 'dva', 'continuous', 'combined', or 'ccdd'
+        device: torch device
+        batch_size: Batch size for evaluation
+        **kwargs: Model-specific parameters
+            - num_t_samples: Number of t samples for ELBO (masked/dva only, default: 10)
+            - tokenizer: Required for dva model (to get mask_token_id)
+            - For continuous: embedding, sqrt_alphas_cumprod, num_timesteps
+            - For combined: embedding, combined_coef, combine_method
+            - For ccdd: ccdd_continuous_coef
+
+    Returns:
+        dict with keys: perplexity, avg_nll, avg_nll_bits, accuracy
+    """
+    model.eval()
+
+    num_test_samples = test_data.shape[0]
+    seq_len = test_data.shape[1]
+    total_nll = 0.0
+    total_tokens = 0
+    total_correct = 0
+
+    num_batches = (num_test_samples + batch_size - 1) // batch_size
+
+    with torch.no_grad():
+        for batch_idx in range(num_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, num_test_samples)
+            x = test_data[start_idx:end_idx].to(device)
+            current_batch_size = x.shape[0]
+
+            if model_type == 'masked':
+                # Proper ELBO evaluation - sample multiple t values with 1/t importance weighting
+                num_t_samples = kwargs.get('num_t_samples', 10)
+
+                batch_nll = 0.0
+                for _ in range(num_t_samples):
+                    # Sample masking ratio uniformly from [0, 1]
+                    t = torch.rand((current_batch_size,), device=device)
+
+                    # Create masked input
+                    xt = llada_mask(x, t=t, mask_index=model.mask_index)
+
+                    # Get model predictions
+                    logits = model._forward_without_loss(xt, t)
+
+                    # Compute NLL on ALL positions
+                    mask = (xt == model.mask_index)
+
+                    if mask.any():
+                        from lib.ops import cross_entropy
+                        nll_per_token = cross_entropy(logits, x)  # [B, L]
+
+                        # Weight by 1/t (importance sampling correction) and apply only to masked positions
+                        t_expanded = t.view(-1, 1).expand_as(nll_per_token)
+                        weighted_nll = nll_per_token / (t_expanded + 1e-8)
+
+                        # Sum weighted NLL only over MASKED positions
+                        masked_weighted_nll = weighted_nll * mask.float()
+                        batch_nll += masked_weighted_nll.sum().item()
+
+                # Average over t samples
+                total_nll += batch_nll / num_t_samples
+                total_tokens += current_batch_size * seq_len
+
+                # Accuracy: evaluate at t=0.5 for consistency
+                t_half = torch.full((current_batch_size,), 0.5, device=device)
+                xt_half = llada_mask(x, t=t_half, mask_index=model.mask_index)
+                logits_half = model._forward_without_loss(xt_half, t_half)
+                preds = logits_half.argmax(dim=-1)
+                total_correct += (preds == x).sum().item()
+
+            elif model_type == 'dva':
+                # DVA ELBO evaluation - similar to masked but using DVA's diffusion steps
+                num_t_samples = kwargs.get('num_t_samples', 10)
+                tokenizer = kwargs['tokenizer']
+                vocab_size = model.vocab_size
+                num_timesteps_dva = model.diffusion_args.diffusion_steps
+
+                batch_nll = 0.0
+                for _ in range(num_t_samples):
+                    # Sample timestep uniformly from [0, T-1]
+                    t = torch.randint(0, num_timesteps_dva, (current_batch_size,), device=device)
+
+                    # Create masked input using DVA's q_sample logic
+                    u = torch.rand_like(x, dtype=torch.float)
+                    t_mask = (u < ((t + 1) / num_timesteps_dva)[:, None])
+                    xt = x.clone()
+                    xt[t_mask] = tokenizer.mask_token_id
+
+                    # Get model predictions
+                    attention_mask = torch.ones_like(xt)
+                    logits = model(xt, t, attention_mask=attention_mask)
+                    logits = torch.cat([logits[:, 0:1], logits[:, :-1]], dim=1)
+
+                    # Compute NLL on masked positions
+                    mask = t_mask
+                    if mask.any():
+                        from lib.ops import cross_entropy
+                        nll_per_token = cross_entropy(logits, x)  # [B, L]
+
+                        # Weight by 1/(t+1) (importance sampling correction)
+                        t_expanded = (t + 1).view(-1, 1).expand_as(nll_per_token).float()
+                        weighted_nll = nll_per_token / (t_expanded + 1e-8)
+
+                        # Sum weighted NLL only over MASKED positions
+                        masked_weighted_nll = weighted_nll * mask.float()
+                        batch_nll += masked_weighted_nll.sum().item()
+
+                # Average over t samples
+                total_nll += batch_nll / num_t_samples
+                total_tokens += current_batch_size * seq_len
+
+                # Accuracy: evaluate at t=10 (mid-range timestep) for consistency
+                t_mid = torch.full((current_batch_size,), num_timesteps_dva // 2, device=device)
+                u_mid = torch.rand_like(x, dtype=torch.float)
+                t_mask_mid = (u_mid < ((t_mid + 1) / num_timesteps_dva)[:, None])
+                xt_mid = x.clone()
+                xt_mid[t_mask_mid] = tokenizer.mask_token_id
+                attention_mask_mid = torch.ones_like(xt_mid)
+                logits_mid = model(xt_mid, t_mid, attention_mask=attention_mask_mid)
+                logits_mid = torch.cat([logits_mid[:, 0:1], logits_mid[:, :-1]], dim=1)
+                preds = logits_mid.argmax(dim=-1)
+                total_correct += (preds == x).sum().item()
+
+            elif model_type == 'continuous':
+                # ELBO evaluation matching plaid implementation
+                # plaid/train.py lines 306-345, 408-413
+                embedding = kwargs['embedding']
+                sqrt_alphas_cumprod = kwargs['sqrt_alphas_cumprod']
+                sqrt_one_minus_alphas_cumprod = kwargs.get('sqrt_one_minus_alphas_cumprod')
+                num_timesteps = kwargs.get('num_timesteps', 1000)
+                num_t_samples = kwargs.get('num_t_samples', 10)
+                gamma_table = kwargs['gamma_table']
+                gamma_prime_table = kwargs['gamma_prime_table']
+
+                # Get clean embeddings
+                x_embed = embedding(x)
+
+                batch_nll = 0.0
+                for _ in range(num_t_samples):
+                    # Sample timesteps uniformly from [0, num_timesteps)
+                    t = torch.randint(0, num_timesteps, (current_batch_size,), device=device)
+
+                    # Get noise schedule values
+                    sqrt_alpha_t = sqrt_alphas_cumprod[t][:, None, None]
+                    sqrt_one_minus_alpha_t = sqrt_one_minus_alphas_cumprod[t][:, None, None]
+
+                    # Add noise: z_t = sqrt(alpha_t) * x_0 + sqrt(1 - alpha_t) * epsilon
+                    noise = torch.randn_like(x_embed)
+                    z_t = sqrt_alpha_t * x_embed + sqrt_one_minus_alpha_t * noise
+
+                    # Convert to continuous time [0, 1]
+                    t_continuous = t.float() / num_timesteps
+
+                    # Get model predictions and reconstructed embeddings
+                    logits = model(z_t, t_continuous)
+
+                    # Plaid uses cross_entropy for reconstruction (reconst_loss)
+                    # and squared error for diffusion (diffusion_loss)
+                    # For perplexity, we use cross_entropy at all timesteps
+                    from lib.ops import cross_entropy
+                    nll_per_token = cross_entropy(logits, x)  # [B, L]
+                    nll_per_sample = nll_per_token.mean(dim=1)  # [B] - match plaid's .mean(dim=1)
+
+                    # Apply SNR weighting (matching plaid line 322)
+                    # diffusion_loss = -0.5 * snr_prime * diff_base
+                    gamma_t = gamma_table[t]
+                    gamma_prime_t = gamma_prime_table[t]
+                    snr_prime = -torch.exp(-gamma_t) * gamma_prime_t
+                    weighted_nll = -0.5 * snr_prime * nll_per_sample  # [B]
+
+                    # Sum over batch (matching plaid's .sum())
+                    batch_nll += weighted_nll.sum().item()
+
+                # Average NLL per sample
+                avg_nll_per_sample = batch_nll / (num_t_samples * current_batch_size)
+
+                # Accumulate total NLL (plaid multiplies by X.numel() = batch_size * seq_len)
+                total_nll += avg_nll_per_sample * current_batch_size * seq_len
+                total_tokens += current_batch_size * seq_len
+
+                # Accuracy: evaluate at t=0 for consistency
+                t_zero = torch.zeros(current_batch_size, dtype=torch.long, device=device)
+                sqrt_alpha_0 = sqrt_alphas_cumprod[t_zero][:, None, None]
+                z_clean = sqrt_alpha_0 * x_embed
+                t_zero_continuous = t_zero.float() / num_timesteps
+                logits_clean = model(z_clean, t_zero_continuous)
+                preds = logits_clean.argmax(dim=-1)
+                total_correct += (preds == x).sum().item()
+
+            elif model_type == 'combined':
+                # Evaluate at t=0 for discrete only
+                embedding = kwargs['embedding']
+                combined_coef = kwargs.get('combined_coef', 1.0)
+
+                t_zero = torch.zeros(current_batch_size, device=device)
+                xt = x.clone()
+                z_disc = model.embed(xt)
+                z_t = torch.zeros_like(z_disc)
+
+                combine_method = kwargs.get('combine_method', 'add')
+                if combine_method == 'add':
+                    z_combined = z_disc + combined_coef * z_t
+                else:
+                    z_combined = torch.cat([z_disc, combined_coef * z_t], dim=-1)
+
+                logits = model.forward_emb2logits(z_combined, t_zero, t_zero)
+
+                from lib.ops import cross_entropy
+                nll_per_token = cross_entropy(logits, x)
+                total_nll += nll_per_token.sum().item()
+                total_tokens += current_batch_size * seq_len
+
+                preds = logits.argmax(dim=-1)
+                total_correct += (preds == x).sum().item()
+
+            elif model_type == 'ccdd':
+                # Evaluate discrete likelihood at t=0
+                ccdd_continuous_coef = kwargs.get('ccdd_continuous_coef', 1.0)
+
+                x_t = x.clone()
+                z_t = torch.zeros(current_batch_size, seq_len, model.latent_dim, device=device)
+                t_zero = torch.zeros(current_batch_size, device=device)
+
+                epsilon_pred, logits_pred = model(x_t, ccdd_continuous_coef * z_t, t_zero)
+
+                from lib.ops import cross_entropy
+                nll_per_token = cross_entropy(logits_pred, x)
+                total_nll += nll_per_token.sum().item()
+                total_tokens += current_batch_size * seq_len
+
+                preds = logits_pred.argmax(dim=-1)
+                total_correct += (preds == x).sum().item()
+
+    # Compute final metrics
+    avg_nll = total_nll / total_tokens
+    avg_nll_bits = avg_nll / torch.log(torch.tensor(2.0)).item()
+    perplexity = torch.exp(torch.tensor(avg_nll)).item()
+    accuracy = total_correct / total_tokens
+
+    model.train()
+
+    return {
+        'perplexity': perplexity,
+        'avg_nll': avg_nll,
+        'avg_nll_bits': avg_nll_bits,
+        'accuracy': accuracy,
+    }
+
+
 @iex
 def main(**args):
     # Default arguments
@@ -498,6 +948,11 @@ def main(**args):
     dataset_type = str(args.get('dataset', 'simple')).lower()
     sudoku_train_path = args.get('sudoku_train_path', 'data_vmd/sudoku_train.csv')
     sudoku_test_path = args.get('sudoku_test_path', 'data_vmd/sudoku_test.csv')
+
+    # Sudoku input type: 'solution_only' (default) or 'quiz_solution'
+    sudoku_input_type = str(args.get('sudoku_input_type', 'solution_only')).lower()
+    if sudoku_input_type not in ['solution_only', 'quiz_solution']:
+        raise ValueError(f"sudoku_input_type must be 'solution_only' or 'quiz_solution', got '{sudoku_input_type}'")
 
     # Model selection
     model_type = str(args.get('model_type', 'continuous')).lower()  # 'continuous' or 'masked'
@@ -588,13 +1043,32 @@ def main(**args):
 
     # Dataset / problem setup
     if dataset_type == 'sudoku':
-        vocab_size = 10  # Digits 0-9 (but we'll use 1-9 for Sudoku)
-        seq_len = 81     # 9x9 grid
+        # Vocab: 0-9 (digits) + mask token (10) + SEP token (11) + EOF token (12)
+        vocab_size = 13
+
+        # Define special token indices
+        SEP_TOKEN_ID = 11
+        EOF_TOKEN_ID = 12
+
+        # Sequence length depends on input type
+        if sudoku_input_type == 'solution_only':
+            seq_len = 81  # 9x9 grid (solution only)
+        elif sudoku_input_type == 'quiz_solution':
+            seq_len = 164  # quiz (81) + SEP (1) + solution (81) + EOF (1)
+
         data = None
         test_data = None
+        test_quiz = None
         if not sampling_only:
-            data = load_sudoku_dataset(sudoku_train_path)
-            test_quiz, test_data = load_sudoku_dataset(sudoku_test_path)
+            data = load_sudoku_dataset(sudoku_train_path, input_type=sudoku_input_type,
+                                      sep_token_id=SEP_TOKEN_ID, eof_token_id=EOF_TOKEN_ID)
+            test_quiz, test_data = load_sudoku_dataset(sudoku_test_path, input_type='solution_only')  # Test always returns (quiz, solution) separately
+
+        print(f"[sudoku] Input type: {sudoku_input_type}")
+        print(f"[sudoku] Vocabulary size: {vocab_size} (0-9 digits + mask + SEP + EOF)")
+        print(f"[sudoku] Training sequence length: {seq_len}")
+        if sudoku_input_type == 'quiz_solution':
+            print(f"[sudoku] Format: quiz(81) + SEP(1) + solution(81) + EOF(1) = {seq_len} tokens")
 
     elif dataset_type == 'sequential':
         # original 4-token toy sequence
@@ -604,6 +1078,28 @@ def main(**args):
         test_data = None
         if not sampling_only:
             data = create_simple_dataset()
+
+    elif dataset_type == 'text8':
+        # text8 dataset with 27-token vocabulary (a-z + space)
+        vocab_size = 27  # a-z (0-25) + space (26)
+        seq_len = args.get('seq_len', 64)  # Configurable, default 64
+        data = None
+        test_data = None
+
+        if not sampling_only:
+            text8_stride = args.get('text8_stride', None)  # Default: seq_len // 2
+
+            # Load train and validation splits and combine them
+            print("[text8] Loading train and validation splits for training...")
+            train_data = load_text8_dataset(split='train', seq_len=seq_len, stride=text8_stride)
+            val_data = load_text8_dataset(split='validation', seq_len=seq_len, stride=text8_stride)
+            data = torch.cat([train_data, val_data], dim=0)
+            print(f"[text8] Combined training data shape: {data.shape}")
+
+            # Load test split for perplexity evaluation (no overlap)
+            test8_eval_stride = args.get('text8_eval_stride', seq_len)
+            test_data = load_text8_dataset(split='test', seq_len=seq_len, stride=test8_eval_stride)
+            print(f"[text8] Test data for perplexity evaluation: {test_data.shape}")
 
     else:
         raise Exception
@@ -722,6 +1218,7 @@ def main(**args):
             dataset_type=dataset_type,
             transformer_block_type=transformer_block_type
         ).to(device)
+        # model = dva_model.to(device)
         print(f"Using Masked Diffusion Model (MDM)")
         print(f"  Architecture: SAME as Continuous Model")
         print(f"  vocab_size: {vocab_size}, seq_len: {seq_len}")
@@ -729,6 +1226,18 @@ def main(**args):
         print(f"  n_heads: {n_heads}, n_layers: {n_blocks}")
         print(f"  positional_encoding: {positional_encoding}")
         print(f"  transformer_block_type: {transformer_block_type}")
+    elif model_type == 'dva':
+        # DVA (Diffusion vs AR) Masked Diffusion Model
+        embedding = None
+        model = dva_model.to(device)
+        tokenizer = dva_tokenizer
+        vocab_size = model.vocab_size
+        print(f"Using DVA Masked Diffusion Model")
+        print(f"  Architecture: Pre-trained GPT2-style model with diffusion wrapper")
+        print(f"  vocab_size: {vocab_size}")
+        print(f"  embed_dim: {model.embed_dim}")
+        print(f"  hidden_dim: {model.hidden_dim}")
+        print(f"  mask_index: {model.mask_index}")
     elif model_type == 'continuous':
         # Setup embedding
         if embedding_type == "onehot":
@@ -866,8 +1375,8 @@ def main(**args):
 
             embedding.load_state_dict(checkpoint['embedding_state_dict'])
             model.load_state_dict(checkpoint['model_state_dict'])
-        elif model_type == 'masked' or model_type == 'combined' or model_type == 'ccdd':
-            # For masked/combined/ccdd model, validate config if available
+        elif model_type == 'masked' or model_type == 'combined' or model_type == 'ccdd' or model_type == 'dva':
+            # For masked/combined/ccdd/dva model, validate config if available
             if model_type == 'combined' and 'config' in checkpoint:
                 saved_combine_method = str(checkpoint_config.get('combine_method', 'add')).lower()
                 if saved_combine_method != combine_method:
@@ -883,13 +1392,13 @@ def main(**args):
                         f"CCDD model architecture requires matching latent dimensions."
                     )
             # Load model state
-            model.load_state_dict(checkpoint.get('model_state_dict', checkpoint))
+            model.load_state_dict(checkpoint.get('model_state_dict', checkpoint), strict=False)
         else:
             raise Exception("Unsupported model type for loading checkpoint.")
 
     ### 3. Optimizers - setup based on model type
-    if model_type == 'masked' or model_type == 'combined' or model_type == 'ccdd':
-        # Masked/Combined/CCDD model: single optimizer for all parameters
+    if model_type == 'masked' or model_type == 'combined' or model_type == 'ccdd' or model_type == 'dva':
+        # Masked/Combined/CCDD/DVA model: single optimizer for all parameters
         optimizer_model = optim.AdamW(
             model.parameters(),
             lr=lr,
@@ -1010,13 +1519,39 @@ def main(**args):
             if model_type == 'masked':
                 # ===== MASKED DIFFUSION MODEL TRAINING =====
                 # Sample masking probability: higher values = more masking
-                t = torch.rand((x.shape[0],), device=device)  # Range [0.0, 1.0]
+                # t = torch.rand((x.shape[0],), device=device)  # Range [0.0, 1.0]
 
+                t = torch.randint(0, 20, (x.shape[0], ), device=x.device).float() / 20
+                
                 # Create masked input using llada_mask
-                xt = llada_mask(x, t=t, mask_index=model.mask_index)
+                if dataset_type == 'sudoku' and sudoku_input_type == 'quiz_solution':
+                    # For quiz+solution mode with SEP/EOF tokens:
+                    # Format: quiz(0-80) + SEP(81) + solution(82-162) + EOF(163)
+                    # Only mask the solution portion (positions 82-162)
+                    quiz_and_sep = x[:, :82]  # quiz (81) + SEP (1) - keep unmasked
+                    solution_part = x[:, 82:163]  # solution (81 tokens) - mask this
+                    eof_token = x[:, 163:164]  # EOF (1) - keep unmasked
+                    
+
+                    # Apply masking only to solution portion
+                    solution_masked = llada_mask(solution_part, t=t, mask_index=model.mask_index)
+
+                    # Concatenate: quiz+SEP (unmasked) + solution (masked) + EOF (unmasked)
+                    xt = torch.cat([quiz_and_sep, solution_masked, eof_token], dim=1)
+                else:
+                    # Default: mask the entire sequence
+                    xt = llada_mask(x, t=t, mask_index=model.mask_index)
 
                 # Forward pass - returns loss directly
-                loss = model(xt, x, t)
+                loss_diff = model(xt, x, t)
+
+                # Dispersive loss: directly on token embeddings (exclude mask token)
+                dispersive_loss = get_dispersion_loss(
+                    model.embed.weight[:-1, :].repeat(batch_size, 1)
+                ) * 0
+
+                # Total loss: diffusion loss + dispersive loss
+                loss = loss_diff + dispersive_loss
 
                 # Backward and optimize
                 optimizer_model.zero_grad()
@@ -1027,7 +1562,7 @@ def main(**args):
                 # Track losses
                 total_losses.append(loss.item())
                 recon_losses.append(0.0)  # Not applicable for masked model
-                diffusion_losses.append(loss.item())
+                diffusion_losses.append(loss_diff.item())
                 prior_losses.append(0.0)  # Not applicable for masked model
 
                 # Validation: compute accuracy on masked positions
@@ -1046,18 +1581,48 @@ def main(**args):
                         else:
                             acc = 0.0
 
-                        # Also compute overall accuracy (including unmasked positions)
-                        overall_acc = (preds == x).float().mean().item()
+                        # Compute accuracy based on mode
+                        if dataset_type == 'sudoku' and sudoku_input_type == 'quiz_solution':
+                            # For quiz+solution mode: only compute accuracy on solution portion (positions 82-162)
+                            solution_preds = preds[:, 82:163]
+                            solution_targets = x[:, 82:163]
+                            overall_acc = (solution_preds == solution_targets).float().mean().item()
+                        else:
+                            # Default: compute overall accuracy on entire sequence
+                            overall_acc = (preds == x).float().mean().item()
 
                     # Print progress with validation metrics
                     avg_mask_ratio = mask.float().mean().item()
-                    print(f"[Step {step+1:>6}/{steps}] loss={loss.item():.4f} | "
+                    print(f"[Step {step+1:>6}/{steps}] loss={loss.item():.4f} (diff={loss_diff.item():.4f} disp={dispersive_loss.item():.4f}) | "
                           f"mask_acc={acc:.4f} overall_acc={overall_acc:.4f} | "
                           f"mask_ratio={avg_mask_ratio:.2f} lr={scheduler_model.get_last_lr()[0]:.2e}")
 
+                    # Display sample predictions as text for text8
+                    if dataset_type == 'text8' and step % (print_freq * 5) == 0:
+                        print("  Sample predictions (masked positions shown as [?]):")
+                        for i in range(min(3, batch_size)):
+                            # Decode with mask indicators
+                            input_chars = []
+                            for j, token in enumerate(xt[i].tolist()):
+                                if token == model.mask_index:
+                                    input_chars.append('[?]')
+                                else:
+                                    decoded = decode_text8_tokens([token])
+                                    input_chars.append(decoded)
+                            input_text = ''.join(input_chars)[:60] + "..."
+
+                            target_text = decode_text8_tokens(x[i])[:60] + "..."
+                            pred_text = decode_text8_tokens(preds[i])[:60] + "..."
+
+                            print(f"    Input:  {input_text}")
+                            print(f"    Target: {target_text}")
+                            print(f"    Pred:   {pred_text}")
+                            print()
+
                     # Log to TensorBoard
                     writer.add_scalar('Loss/total', loss.item(), step)
-                    writer.add_scalar('Loss/masked', loss.item(), step)
+                    writer.add_scalar('Loss/diffusion', loss_diff.item(), step)
+                    writer.add_scalar('Loss/dispersive', dispersive_loss.item(), step)
                     writer.add_scalar('Metrics/masked_accuracy', acc, step)
                     writer.add_scalar('Metrics/overall_accuracy', overall_acc, step)
                     writer.add_scalar('Metrics/mask_ratio', avg_mask_ratio, step)
@@ -1081,6 +1646,159 @@ def main(**args):
                             tag='token_embeddings'
                         )
 
+                # PERPLEXITY EVALUATION (every 1000 steps)
+                if step % 1000 == 0 and dataset_type == 'text8' and test_data is not None:
+                    num_t_samples = args.get('num_t_samples', 10)
+                    print(f"\n{'='*60}")
+                    print(f"PERPLEXITY EVALUATION (Masked Model) - Step {step}")
+                    print(f"Using ELBO with {num_t_samples} t-samples and 1/t weighting on masked positions")
+                    print(f"{'='*60}")
+
+                    perplexity_results = compute_perplexity_text8(
+                        model=model,
+                        test_data=test_data,
+                        model_type='masked',
+                        device=device,
+                        batch_size=args.get('eval_batch_size', 128),
+                        num_t_samples=num_t_samples
+                    )
+
+                    print(f"Test Perplexity: {perplexity_results['perplexity']:.4f}")
+                    print(f"Test NLL (bits/token): {perplexity_results['avg_nll_bits']:.4f}")
+                    print(f"Test Accuracy (t=0.5): {perplexity_results['accuracy']:.4f}")
+                    print(f"{'='*60}\n")
+
+                    writer.add_scalar('Perplexity/test_perplexity', perplexity_results['perplexity'], step)
+                    writer.add_scalar('Perplexity/test_nll_bits', perplexity_results['avg_nll_bits'], step)
+                    writer.add_scalar('Perplexity/test_accuracy', perplexity_results['accuracy'], step)
+
+            elif model_type == 'dva':
+                # ===== DVA MASKED DIFFUSION MODEL TRAINING =====
+                # Based on CustomDiffusionTrainer from diffusion-vs-ar
+
+                # Define src_mask (positions that should NOT be masked)
+                # For sudoku quiz_solution mode: quiz+SEP+EOF should not be masked
+                if dataset_type == 'sudoku' and sudoku_input_type == 'quiz_solution':
+                    # Format: quiz(0-80) + SEP(81) + solution(82-162) + EOF(163)
+                    # src_mask = True for positions that should NOT be masked
+                    src_mask = torch.zeros_like(x, dtype=torch.bool)
+                    src_mask[:, :82] = True   # quiz (81) + SEP (1)
+                    src_mask[:, 163] = True   # EOF
+                else:
+                    # For other datasets, all positions are maskable
+                    src_mask = torch.zeros_like(x, dtype=torch.bool)
+
+                # maskable_mask = positions that CAN be masked (inverse of src_mask)
+                maskable_mask = ~src_mask
+
+                # Sample random timesteps for the batch
+                num_timesteps_dva = model.diffusion_args.diffusion_steps
+                t = torch.randint(0, num_timesteps_dva, (x.shape[0],), device=device)
+
+                # Create masked input using q_sample method (matching trainer.py line 55-60)
+                # Masking probability: (t+1) / T, but only on maskable positions
+                u = torch.rand_like(x, dtype=torch.float)
+                t_mask = (u < ((t + 1) / num_timesteps_dva)[:, None]) & maskable_mask
+
+                # Apply mask to create x_t (masked input)
+                xt = x.clone()
+                xt[t_mask] = tokenizer.mask_token_id
+
+                # Forward pass through model
+                attention_mask = torch.ones_like(xt)
+                logits = model(xt, t, attention_mask=attention_mask)
+
+                # Shift logits for autoregressive-style loss
+                logits = torch.cat([logits[:, 0:1], logits[:, :-1]], dim=1)
+
+                # Compute cross-entropy loss
+                loss = F.cross_entropy(
+                    logits.reshape(-1, vocab_size),
+                    x.reshape(-1),
+                    reduction="none"
+                ).float()
+
+                # Only compute loss on masked positions
+                loss = loss.masked_fill(~t_mask.reshape(-1), 0)
+
+                # Token reweighting (focal loss style)
+                if model.diffusion_args.token_reweighting:
+                    alpha = model.diffusion_args.alpha
+                    gamma = model.diffusion_args.gamma
+                    loss = alpha * (1 - torch.exp(-loss)) ** gamma * loss
+
+                # Time reweighting
+                if model.diffusion_args.time_reweighting == 'original':
+                    weight = 1 / (t + 1)[:, None].float()
+                elif model.diffusion_args.time_reweighting == 'linear':
+                    weight = (num_timesteps_dva - t)[:, None].float()
+                else:
+                    weight = t.new_ones((x.shape[0], 1)).float()
+
+                weight = weight.expand(t_mask.size())
+                loss_diff = (loss * weight.reshape(-1)).sum() / t_mask.sum()
+
+                # Total loss
+                loss = loss_diff
+
+                # Backward and optimize
+                optimizer_model.zero_grad()
+                loss.backward()
+                optimizer_model.step()
+                scheduler_model.step()
+
+                # Track losses
+                total_losses.append(loss.item())
+                recon_losses.append(0.0)
+                diffusion_losses.append(loss_diff.item())
+                prior_losses.append(0.0)
+
+                # Validation: compute accuracy on masked positions
+                if step % print_freq == 0 or step == steps - 1:
+                    with torch.no_grad():
+                        # Get predictions
+                        preds = logits.argmax(dim=-1)
+
+                        # Compute accuracy only on masked positions
+                        mask = t_mask
+                        if mask.any():
+                            masked_preds = preds[mask]
+                            masked_targets = x[mask]
+                            acc = (masked_preds == masked_targets).float().mean().item()
+                        else:
+                            acc = 0.0
+
+                        # Compute overall accuracy
+                        if dataset_type == 'sudoku' and sudoku_input_type == 'quiz_solution':
+                            # Only measure solution portion (positions 82-162)
+                            pred_solution = preds[:, 82:163]
+                            target_solution = x[:, 82:163]
+                            overall_acc = (pred_solution == target_solution).float().mean().item()
+                        else:
+                            overall_acc = (preds == x).float().mean().item()
+
+                    # Print progress
+                    avg_mask_ratio = mask.float().mean().item()
+                    print(f"[Step {step+1:>6}/{steps}] loss={loss.item():.4f} (diff={loss_diff.item():.4f}) | "
+                          f"mask_acc={acc:.4f} overall_acc={overall_acc:.4f} | "
+                          f"mask_ratio={avg_mask_ratio:.2f} lr={scheduler_model.get_last_lr()[0]:.2e}")
+
+                    # Log to TensorBoard
+                    writer.add_scalar('Loss/total', loss.item(), step)
+                    writer.add_scalar('Loss/diffusion', loss_diff.item(), step)
+                    writer.add_scalar('Metrics/masked_accuracy', acc, step)
+                    writer.add_scalar('Metrics/overall_accuracy', overall_acc, step)
+                    writer.add_scalar('Metrics/mask_ratio', avg_mask_ratio, step)
+                    writer.add_scalar('Learning_Rate/model', scheduler_model.get_last_lr()[0], step)
+
+                    # Log model parameter histograms periodically
+                    if step % (print_freq * 10) == 0:
+                        for name, param in model.named_parameters():
+                            if param.requires_grad:
+                                writer.add_histogram(f'Model/{name}', param.data, step)
+                                if param.grad is not None:
+                                    writer.add_histogram(f'Model/{name}.grad', param.grad, step)
+
             elif model_type == 'continuous':
                 # ===== CONTINUOUS DIFFUSION MODEL TRAINING =====
                 # get clean embeddings
@@ -1097,8 +1815,22 @@ def main(**args):
                 sqrt_one_minus_alpha_t = sqrt_one_minus_alphas_cumprod[t][:, None, None]
 
                 # Add noise in DDPM style: x_t = sqrt(alpha_t) * x_0 + sqrt(1 - alpha_t) * epsilon
-                noise = torch.randn_like(x_embed)
-                z = sqrt_alpha_t * x_embed + sqrt_one_minus_alpha_t * noise
+                if dataset_type == 'sudoku' and sudoku_input_type == 'quiz_solution':
+                    # Split into parts: quiz+SEP (0-81), solution (82-162), EOF (163)
+                    quiz_sep_embed = x_embed[:, :82, :]       # [batch, 82, embed_dim]
+                    solution_embed = x_embed[:, 82:163, :]    # [batch, 81, embed_dim]
+                    eof_embed = x_embed[:, 163:164, :]        # [batch, 1, embed_dim]
+
+                    # Only add noise to solution portion
+                    solution_noise = torch.randn_like(solution_embed)
+                    solution_z = sqrt_alpha_t * solution_embed + sqrt_one_minus_alpha_t * solution_noise
+
+                    # Concatenate: quiz+SEP (clean) + solution (noisy) + EOF (clean)
+                    z = torch.cat([quiz_sep_embed, solution_z, eof_embed], dim=1)
+                else:
+                    # Original behavior for other modes
+                    noise = torch.randn_like(x_embed)
+                    z = sqrt_alpha_t * x_embed + sqrt_one_minus_alpha_t * noise
 
                 # Convert discrete timestep to continuous [0, 1] for model input
                 t_continuous = t.float() / denom
@@ -1113,8 +1845,15 @@ def main(**args):
 
                 # Reconstruction loss (first reconst_bs elements)
                 if reconst_bs > 0:
-                    reconst_terms = lib_ops.cross_entropy(logits[:reconst_bs], x[:reconst_bs]).mean(dim=1)
-                    reconst_loss = reconst_terms.mean()
+                    if dataset_type == 'sudoku' and sudoku_input_type == 'quiz_solution':
+                        # Only compute loss on solution portion (positions 82-162)
+                        logits_solution = logits[:reconst_bs, 82:163, :]  # [reconst_bs, 81, vocab_size]
+                        x_solution = x[:reconst_bs, 82:163]               # [reconst_bs, 81]
+                        reconst_terms = lib_ops.cross_entropy(logits_solution, x_solution).mean(dim=1)
+                        reconst_loss = reconst_terms.mean()
+                    else:
+                        reconst_terms = lib_ops.cross_entropy(logits[:reconst_bs], x[:reconst_bs]).mean(dim=1)
+                        reconst_loss = reconst_terms.mean()
                 else:
                     reconst_terms = torch.empty(0, device=device)
                     reconst_loss = torch.tensor(0.0, device=device)
@@ -1122,7 +1861,15 @@ def main(**args):
                 gamma_t = gamma_table[t]
                 gamma_prime_t = gamma_prime_table[t]
                 snr_prime = -torch.exp(-gamma_t) * gamma_prime_t
-                diff_base = (x_embed - x_reconst).pow(2).mean(dim=1).sum(dim=1)
+
+                if dataset_type == 'sudoku' and sudoku_input_type == 'quiz_solution':
+                    # Only compute diffusion loss on solution portion (positions 82-162)
+                    x_embed_solution = x_embed[:, 82:163, :]
+                    x_reconst_solution = x_reconst[:, 82:163, :]
+                    diff_base = (x_embed_solution - x_reconst_solution).pow(2).mean(dim=1).sum(dim=1)
+                else:
+                    diff_base = (x_embed - x_reconst).pow(2).mean(dim=1).sum(dim=1)
+
                 diffusion_vals = -0.5 * snr_prime * diff_base
                 diffusion_vals = diff_base
                 diffusion_tail = diffusion_vals[reconst_bs:] if reconst_bs < batch_size else torch.empty(0, device=device)
@@ -1146,6 +1893,7 @@ def main(**args):
 
                 ### Option #1: directly on embeddings (COMMENTED OUT)
                 dispersive_loss = get_dispersion_loss(get_embedding_matrix().repeat(batch_size, 1)) * 1e1
+                loss = loss + dispersive_loss
 
                 ### Option #3: dispersive loss on layer activations, gradient only affects embeddings
                 # Computed separately - will be handled by separate embedding optimizer
@@ -1202,9 +1950,9 @@ def main(**args):
                 optimizer_model.step()
                 scheduler_model.step()
 
-                if repae:
-                    optimizer_embedding.step()
-                    scheduler_embedding.step()
+                # Always step embedding optimizer (not just when repae=True)
+                optimizer_embedding.step()
+                scheduler_embedding.step()
 
                 total_losses.append(float(loss.detach()))
                 recon_losses.append(float(reconst_loss.detach()))
@@ -1224,7 +1972,24 @@ def main(**args):
                         t_zero_continuous = t_zero.float() / num_timesteps
                         logits_clean = model(z_clean, t_zero_continuous)
                         preds = logits_clean.argmax(dim=-1)
-                        acc = (preds == x).float().mean().item()
+
+                        if dataset_type == 'sudoku' and sudoku_input_type == 'quiz_solution':
+                            # Only measure solution portion (positions 82-162)
+                            pred_solution = preds[:, 82:163]
+                            target_solution = x[:, 82:163]
+                            acc = (pred_solution == target_solution).float().mean().item()
+                        else:
+                            acc = (preds == x).float().mean().item()
+
+                    # Display sample predictions as text for text8
+                    if dataset_type == 'text8' and step % (print_freq * 5) == 0:
+                        print("  Sample predictions (continuous model at t=0):")
+                        for i in range(min(3, batch_size)):
+                            target_text = decode_text8_tokens(x[i])[:80] + "..."
+                            pred_text = decode_text8_tokens(preds[i])[:80] + "..."
+                            print(f"    Target: {target_text}")
+                            print(f"    Pred:   {pred_text}")
+                            print()
 
                     # TensorBoard logging
                     writer.add_scalar('Loss/total', loss.item(), step)
@@ -1255,9 +2020,41 @@ def main(**args):
                                 if param.grad is not None:
                                     writer.add_histogram(f'Model/{name}.grad', param.grad, step)
 
-                    print(get_embedding_matrix())
-                    print(f"{step:>6} | recon={reconst_val:.4f} diff_tail={diff_tail_val:.4f} prior={prior_loss.item():.4f} "
-                          f"loss={loss.item():.4f} (diff_mean={total_diffusion:.4f}) disp_loss={dispersive_loss:.4f} acc={acc:.4f}")
+                    # Print progress (removed debug print of embedding matrix)
+                    print(f"[Step {step+1:>6}/{steps}] loss={loss.item():.4f} (recon={reconst_val:.4f} diff={diff_tail_val:.4f} prior={prior_loss.item():.4f} disp={dispersive_loss:.4f}) | "
+                          f"acc@t=0={acc:.4f} lr={scheduler_model.get_last_lr()[0]:.2e}")
+
+                # PERPLEXITY EVALUATION (every 1000 steps)
+                if step % 1000 == 0 and dataset_type == 'text8' and test_data is not None:
+                    num_t_samples = args.get('num_t_samples', 10)
+                    print(f"\n{'='*60}")
+                    print(f"PERPLEXITY EVALUATION (Continuous Model) - Step {step}")
+                    print(f"Using ELBO with {num_t_samples} t-samples and SNR weighting")
+                    print(f"{'='*60}")
+
+                    perplexity_results = compute_perplexity_text8(
+                        model=model,
+                        test_data=test_data,
+                        model_type='continuous',
+                        device=device,
+                        batch_size=args.get('eval_batch_size', 128),
+                        embedding=embedding,
+                        sqrt_alphas_cumprod=sqrt_alphas_cumprod,
+                        sqrt_one_minus_alphas_cumprod=sqrt_one_minus_alphas_cumprod,
+                        num_timesteps=num_timesteps,
+                        num_t_samples=num_t_samples,
+                        gamma_table=gamma_table,
+                        gamma_prime_table=gamma_prime_table
+                    )
+
+                    print(f"Test Perplexity: {perplexity_results['perplexity']:.4f}")
+                    print(f"Test NLL (bits/token): {perplexity_results['avg_nll_bits']:.4f}")
+                    print(f"Test Accuracy: {perplexity_results['accuracy']:.4f}")
+                    print(f"{'='*60}\n")
+
+                    writer.add_scalar('Perplexity/test_perplexity', perplexity_results['perplexity'], step)
+                    writer.add_scalar('Perplexity/test_nll_bits', perplexity_results['avg_nll_bits'], step)
+                    writer.add_scalar('Perplexity/test_accuracy', perplexity_results['accuracy'], step)
 
             elif model_type == 'combined':
                 # ===== COMBINED MODEL TRAINING =====
@@ -1267,7 +2064,20 @@ def main(**args):
                 t_cont = torch.rand((x.shape[0],), device=device)  # For continuous noise [0.0, 1.0]
 
                 # add mask (use t_disc for discrete masking)
-                xt = llada_mask(x, t=t_disc, mask_index=model.mask_index) # [B, seq_len]
+                if dataset_type == 'sudoku' and sudoku_input_type == 'quiz_solution':
+                    # Only mask solution portion (positions 82-162)
+                    quiz_and_sep = x[:, :82]        # quiz(81) + SEP(1) - keep unmasked
+                    solution_part = x[:, 82:163]    # solution(81) - mask this
+                    eof_token = x[:, 163:164]       # EOF(1) - keep unmasked
+                    
+                    # Apply masking only to solution
+                    solution_masked = llada_mask(solution_part, t=t_disc, mask_index=model.mask_index)
+
+                    # Concatenate back
+                    xt = torch.cat([quiz_and_sep, solution_masked, eof_token], dim=1)
+                else:
+                    # Original behavior for other modes
+                    xt = llada_mask(x, t=t_disc, mask_index=model.mask_index) # [B, seq_len]
 
                 # Get discrete embeddings from masked input (z_disc)
                 z_disc = model.embed(xt)  # [B, seq_len, embed_dim]
@@ -1287,23 +2097,52 @@ def main(**args):
                 mask = (xt == model.mask_index).unsqueeze(-1)  # [B, seq_len, 1]
 
                 # Generate Gaussian noise
-                noise = torch.randn_like(x_clean_embed)  # [B, seq_len, embed_dim]
+                if dataset_type == 'sudoku' and sudoku_input_type == 'quiz_solution':
+                    # Only add noise to solution portion (positions 82-162)
+                    quiz_sep_embed = x_clean_embed[:, :82, :]       # quiz + SEP (clean)
+                    solution_embed = x_clean_embed[:, 82:163, :]    # solution
+                    eof_embed = x_clean_embed[:, 163:164, :]        # EOF (clean)
 
-                # Create z_t: behavior depends on combine_method
-                if combine_method == 'add':
-                    # ADD mode: noisy for masked, zero for unmasked (original CADD)
-                    z_t = torch.where(
-                        mask,
-                        sqrt_alpha_t * x_clean_embed + sqrt_one_minus_alpha_t * noise,  # Noisy for masked positions
-                        torch.zeros_like(x_clean_embed)  # Zero for unmasked positions
-                    )
-                else:  # concat
-                    # CONCAT mode: noisy for masked, clean for unmasked
-                    z_t = torch.where(
-                        mask,
-                        sqrt_alpha_t * x_clean_embed + sqrt_one_minus_alpha_t * noise,  # Noisy for masked positions
-                        x_clean_embed  # Clean embeddings for unmasked positions
-                    )
+                    # Only noise solution
+                    solution_noise = torch.randn_like(solution_embed)
+                    solution_epsilon = solution_noise  # Save for loss computation
+                    solution_z_t = sqrt_alpha_t * solution_embed + sqrt_one_minus_alpha_t * solution_noise
+
+                    # Create z_t based on combine_method
+                    if combine_method == 'add':
+                        # ADD mode: quiz+EOF are zero, solution is noisy
+                        z_t = torch.cat([
+                            torch.zeros_like(quiz_sep_embed),
+                            solution_z_t,
+                            torch.zeros_like(eof_embed)
+                        ], dim=1)
+                    else:  # concat
+                        # CONCAT mode: quiz+EOF are clean, solution is noisy
+                        z_t = torch.cat([
+                            quiz_sep_embed,
+                            solution_z_t,
+                            eof_embed
+                        ], dim=1)
+                else:
+                    # Original behavior for other modes
+                    noise = torch.randn_like(x_clean_embed)  # [B, seq_len, embed_dim]
+                    epsilon = noise  # Save for loss computation
+
+                    # Create z_t: behavior depends on combine_method
+                    if combine_method == 'add':
+                        # ADD mode: noisy for masked, zero for unmasked (original CADD)
+                        z_t = torch.where(
+                            mask,
+                            sqrt_alpha_t * x_clean_embed + sqrt_one_minus_alpha_t * noise,  # Noisy for masked positions
+                            torch.zeros_like(x_clean_embed)  # Zero for unmasked positions
+                        )
+                    else:  # concat
+                        # CONCAT mode: noisy for masked, clean for unmasked
+                        z_t = torch.where(
+                            mask,
+                            sqrt_alpha_t * x_clean_embed + sqrt_one_minus_alpha_t * noise,  # Noisy for masked positions
+                            x_clean_embed  # Clean embeddings for unmasked positions
+                        )
 
                 # Apply dropout to z_t: randomly drop continuous latents during training
                 if dropout_rate > 0.0:
@@ -1348,14 +2187,42 @@ def main(**args):
                         else:
                             acc = 0.0
 
-                        # Also compute overall accuracy (including unmasked positions)
-                        overall_acc = (preds == x).float().mean().item()
+                        # Also compute overall accuracy
+                        if dataset_type == 'sudoku' and sudoku_input_type == 'quiz_solution':
+                            # Only measure solution portion (positions 82-162)
+                            pred_solution = preds[:, 82:163]
+                            target_solution = x[:, 82:163]
+                            overall_acc = (pred_solution == target_solution).float().mean().item()
+                        else:
+                            overall_acc = (preds == x).float().mean().item()
 
                     # Print progress with validation metrics
                     avg_mask_ratio = mask.float().mean().item()
                     print(f"[Step {step+1:>6}/{steps}] loss={loss.item():.4f} | "
                           f"mask_acc={acc:.4f} overall_acc={overall_acc:.4f} | "
                           f"mask_ratio={avg_mask_ratio:.2f} lr={scheduler_model.get_last_lr()[0]:.2e}")
+
+                    # Display sample predictions as text for text8
+                    if dataset_type == 'text8' and step % (print_freq * 5) == 0:
+                        print("  Sample predictions (masked positions shown as [?]):")
+                        for i in range(min(3, batch_size)):
+                            # Decode with mask indicators
+                            input_chars = []
+                            for j, token in enumerate(xt[i].tolist()):
+                                if token == model.mask_index:
+                                    input_chars.append('[?]')
+                                else:
+                                    decoded = decode_text8_tokens([token])
+                                    input_chars.append(decoded)
+                            input_text = ''.join(input_chars)[:60] + "..."
+
+                            target_text = decode_text8_tokens(x[i])[:60] + "..."
+                            pred_text = decode_text8_tokens(preds[i])[:60] + "..."
+
+                            print(f"    Input:  {input_text}")
+                            print(f"    Target: {target_text}")
+                            print(f"    Pred:   {pred_text}")
+                            print()
 
                     # Log to TensorBoard
                     writer.add_scalar('Loss/total', loss.item(), step)
@@ -1382,6 +2249,32 @@ def main(**args):
                             global_step=step,
                             tag='token_embeddings'
                         )
+
+                # PERPLEXITY EVALUATION (every 1000 steps)
+                if step % 1000 == 0 and dataset_type == 'text8' and test_data is not None:
+                    print(f"\n{'='*60}")
+                    print(f"PERPLEXITY EVALUATION (Combined Model) - Step {step}")
+                    print(f"{'='*60}")
+
+                    perplexity_results = compute_perplexity_text8(
+                        model=model,
+                        test_data=test_data,
+                        model_type='combined',
+                        device=device,
+                        batch_size=args.get('eval_batch_size', 128),
+                        embedding=embedding,
+                        combined_coef=combined_coef,
+                        combine_method=combine_method
+                    )
+
+                    print(f"Test Perplexity: {perplexity_results['perplexity']:.4f}")
+                    print(f"Test NLL (bits/token): {perplexity_results['avg_nll_bits']:.4f}")
+                    print(f"Test Accuracy: {perplexity_results['accuracy']:.4f}")
+                    print(f"{'='*60}\n")
+
+                    writer.add_scalar('Perplexity/test_perplexity', perplexity_results['perplexity'], step)
+                    writer.add_scalar('Perplexity/test_nll_bits', perplexity_results['avg_nll_bits'], step)
+                    writer.add_scalar('Perplexity/test_accuracy', perplexity_results['accuracy'], step)
 
             elif model_type == 'ccdd':
                 # ===== CCDD MODEL TRAINING =====
@@ -1493,6 +2386,30 @@ def main(**args):
                                 if param.grad is not None:
                                     writer.add_histogram(f'Model/{name}.grad', param.grad, step)
 
+                # PERPLEXITY EVALUATION (every 1000 steps)
+                if step % 1000 == 0 and dataset_type == 'text8' and test_data is not None:
+                    print(f"\n{'='*60}")
+                    print(f"PERPLEXITY EVALUATION (CCDD Model) - Step {step}")
+                    print(f"{'='*60}")
+
+                    perplexity_results = compute_perplexity_text8(
+                        model=model,
+                        test_data=test_data,
+                        model_type='ccdd',
+                        device=device,
+                        batch_size=args.get('eval_batch_size', 128),
+                        ccdd_continuous_coef=ccdd_continuous_coef
+                    )
+
+                    print(f"Test Perplexity: {perplexity_results['perplexity']:.4f}")
+                    print(f"Test NLL (bits/token): {perplexity_results['avg_nll_bits']:.4f}")
+                    print(f"Test Accuracy: {perplexity_results['accuracy']:.4f}")
+                    print(f"{'='*60}\n")
+
+                    writer.add_scalar('Perplexity/test_perplexity', perplexity_results['perplexity'], step)
+                    writer.add_scalar('Perplexity/test_nll_bits', perplexity_results['avg_nll_bits'], step)
+                    writer.add_scalar('Perplexity/test_accuracy', perplexity_results['accuracy'], step)
+
 
             # Save checkpoint every 10000 iterations
             if checkpoint_path and (step + 1) % 10000 == 0:
@@ -1505,8 +2422,8 @@ def main(**args):
                     os.makedirs(checkpoint_dir, exist_ok=True)
 
                 # Save checkpoint based on model type
-                if model_type == 'masked' or model_type == 'combined' or model_type == 'ccdd':
-                    # Masked/Combined/CCDD model: only save model state
+                if model_type == 'masked' or model_type == 'combined' or model_type == 'ccdd' or model_type == 'dva':
+                    # Masked/Combined/CCDD/DVA model: only save model state
                     checkpoint_config = {
                         'model_type': model_type,
                         'vocab_size': vocab_size,
@@ -1522,6 +2439,9 @@ def main(**args):
                     elif model_type == 'ccdd':
                         checkpoint_config['latent_dim'] = model.latent_dim
                         checkpoint_config['ccdd_continuous_coef'] = ccdd_continuous_coef
+                    elif model_type == 'dva':
+                        checkpoint_config['diffusion_steps'] = model.diffusion_args.diffusion_steps
+                        checkpoint_config['mask_index'] = model.mask_index
 
                     torch.save(
                         {
@@ -1583,7 +2503,9 @@ def main(**args):
                         test_quiz_path = args.get('test_quiz_path', 'data_vmd/sudoku_test.csv')
                         if os.path.exists(test_quiz_path):
                             test_quiz, _ = load_sudoku_dataset(test_quiz_path)
-                            test_quiz = test_quiz[:n_samples].to(device)
+                            rand_test_ids = torch.randperm(test_quiz.size(0))[:n_samples]
+                            test_quiz = test_quiz[rand_test_ids].to(device)
+                            # test_quiz = test_quiz[:n_samples].to(device)
                             print(f"Loaded test quiz data from {test_quiz_path} for completion evaluation")
                             print(f"Quiz data shape: {test_quiz.shape}")
 
@@ -1664,26 +2586,56 @@ def main(**args):
                         print("2. COMPLETION FROM PARTIAL QUIZ")
                         print(f"{'='*60}")
 
-                        z_comp = torch.randn(n_samples, seq_len, embed_dim, device=device) * sqrt_one_minus_alpha_start
+                        # Initialize completion based on input type
+                        if sudoku_input_type == 'quiz_solution':
+                            # test_quiz has full sequence [164] with quiz+SEP+solution+EOF
+                            # Embed the full sequence
+                            full_embed = torch.randn((test_quiz.shape[0], seq_len, embed_dim), dtype=torch.float32, device=device)
+                            full_embed[:, :81, :] = embedding_matrix[test_quiz]  # [batch, 164, embed_dim]
+                            full_embed[:, 81, :] = embedding_matrix[SEP_TOKEN_ID]
+                            full_embed[:, 163:164, :] = embedding_matrix[EOF_TOKEN_ID]
+
+                            # Split into parts
+                            quiz_sep_embed = full_embed[:, :82, :]       # quiz + SEP
+                            solution_embed = full_embed[:, 82:163, :]    # solution (ground truth, will be replaced)
+                            eof_embed = full_embed[:, 163:164, :]        # EOF
+
+                            # Initialize solution with pure noise
+                            solution_noise = torch.randn_like(solution_embed) * sqrt_one_minus_alpha_start
+
+                            # Concatenate: quiz+SEP (given) + solution (noise) + EOF (given)
+                            z_comp = torch.cat([quiz_sep_embed, solution_noise, eof_embed], dim=1)
+                        else:
+                            # solution_only mode: original behavior
+                            z_comp = torch.randn(n_samples, seq_len, embed_dim, device=device) * sqrt_one_minus_alpha_start
 
                         # Denoising loop for completion
                         for step_idx, t_discrete in enumerate(schedule.tolist()):
                             t_tensor = torch.full((n_samples,), t_discrete, dtype=torch.long, device=device)
                             t_continuous = t_tensor.float() / denom
-
                             logits = model(z_comp, t_continuous)
                             probs = F.softmax(logits, dim=-1)
                             x_reconst = probs @ embedding_matrix
                             pred_tokens = logits.argmax(dim=-1)
 
-                            # x_embed_disc = x_reconst
+                            x_embed_disc = x_reconst
                             ### clamping
-                            x_embed_disc = embedding_matrix[pred_tokens]
+                            # x_embed_disc = embedding_matrix[pred_tokens]
 
                             # Inject ground truth quiz values at known positions
-                            quiz_mask = (test_quiz != 0).unsqueeze(-1)
-                            quiz_embeddings = embedding_matrix[test_quiz]
-                            x_embed_disc = torch.where(quiz_mask, quiz_embeddings, x_embed_disc)
+                            if sudoku_input_type == 'quiz_solution':
+                                # Protect quiz+SEP+EOF, only update solution
+                                quiz_sep_eof_protected = torch.cat([
+                                    quiz_sep_embed,      # quiz + SEP (protected)
+                                    x_embed_disc[:, 82:163, :],          # solution (denoised)
+                                    eof_embed   # EOF (protected)
+                                ], dim=1)
+                                x_embed_disc = quiz_sep_eof_protected
+                            else:
+                                # solution_only mode: original behavior
+                                quiz_mask = (test_quiz != 0).unsqueeze(-1)
+                                quiz_embeddings = embedding_matrix[test_quiz]
+                                x_embed_disc = torch.where(quiz_mask, quiz_embeddings, x_embed_disc)
 
                             alpha_t = alphas_cumprod[t_tensor].view(n_samples, 1, 1)
                             sqrt_alpha_t = torch.sqrt(alpha_t)
@@ -1712,8 +2664,19 @@ def main(**args):
                         final_preds_comp = final_logits_comp.argmax(dim=-1)
 
                         # Inject quiz values into final predictions to preserve known positions
-                        quiz_mask_1d = (test_quiz != 0)
-                        final_preds_comp = torch.where(quiz_mask_1d, test_quiz, final_preds_comp)
+                        if sudoku_input_type == 'quiz_solution':
+                            # Preserve quiz+SEP+EOF, only keep predicted solution
+                            # final_preds_comp = torch.cat([
+                            #     test_quiz,              # quiz + SEP (given)
+                            #     final_preds_comp[:, 82:163],    # solution (predicted)
+                            #     torch.full_like(test_quiz[:, :1], EOF_TOKEN_ID)          # EOF (given)
+                            # ], dim=1)
+                            final_preds_comp = final_preds_comp[:, 82:163]
+                            
+                        else:
+                            # solution_only mode: original behavior
+                            quiz_mask_1d = (test_quiz != 0)
+                            final_preds_comp = torch.where(quiz_mask_1d, test_quiz, final_preds_comp)
 
 
                         # Display completion results side-by-side with quiz
@@ -1739,6 +2702,16 @@ def main(**args):
                             prefix="generation",
                             max_display=0
                         )
+                    elif dataset_type == 'text8':
+                        evaluate_and_display_text8(
+                            final_preds_gen,
+                            n_samples,
+                            mode_str="Generation",
+                            writer=writer,
+                            step=step,
+                            prefix="generation",
+                            max_display=10
+                        )
 
             # ===== MASKED MODEL SAMPLING (every 1000 steps) =====
             if step % 1000 == 0 and model_type == 'masked':
@@ -1753,13 +2726,27 @@ def main(**args):
                         test_quiz_path = args.get('test_quiz_path', 'data_vmd/sudoku_test.csv')
                         if os.path.exists(test_quiz_path):
                             test_quiz, _ = load_sudoku_dataset(test_quiz_path)
-                            test_quiz = test_quiz[:n_samples].to(device)
+                            rand_test_ids = torch.randperm(test_quiz.size(0))[:n_samples]
+                            test_quiz = test_quiz[rand_test_ids].to(device)
+                            # test_quiz = test_quiz[:n_samples].to(device)
                             print(f"Loaded test quiz data from {test_quiz_path} for completion evaluation")
                             print(f"Quiz data shape: {test_quiz.shape}")
+                        else:
+                            raise Exception("unexpected")
 
                     # Generation: start from fully masked
                     print(f"\nGenerating {n_samples} samples with {mdm_sampling_steps} unmasking steps (generation)...")
                     gen_xt = torch.full((n_samples, seq_len), model.mask_index, dtype=torch.long, device=device)
+
+                    # For quiz+solution mode: provide quiz+SEP, mask only solution, add EOF
+                    if dataset_type == 'sudoku' and sudoku_input_type == 'quiz_solution' and test_quiz is not None:
+                        # Format: quiz(0-80) + SEP(81) + solution(82-162, masked) + EOF(163)
+                        gen_xt[:, :81] = test_quiz[:n_samples, :81]  # Quiz portion
+                        gen_xt[:, 81] = SEP_TOKEN_ID  # SEP token
+                        # Positions 82-162 remain masked (solution to generate)
+                        gen_xt[:, 163] = EOF_TOKEN_ID  # EOF token
+                        print(f"  Quiz+solution mode: quiz+SEP+EOF provided, generating solution only")
+
                     gen_preds = model.generate(gen_xt, steps=mdm_sampling_steps, temperature=mdm_temperature)
 
                     if dataset_type == 'sudoku':
@@ -1771,6 +2758,16 @@ def main(**args):
                             step=step,
                             prefix="generation",
                             max_display=5
+                        )
+                    elif dataset_type == 'text8':
+                        evaluate_and_display_text8(
+                            gen_preds,
+                            n_samples,
+                            mode_str="Generation",
+                            writer=writer,
+                            step=step,
+                            prefix="generation",
+                            max_display=10
                         )
                     else:
                         evaluate_and_display_sequential(
@@ -1787,9 +2784,23 @@ def main(**args):
                     if test_quiz is not None:
                         comp_samples = test_quiz.shape[0]
                         print(f"\nCompleting {comp_samples} quizzes with {mdm_sampling_steps} unmasking steps (completion)...")
-                        xt = torch.where(test_quiz != 0, test_quiz, torch.full_like(test_quiz, model.mask_index))
-                        num_known = (test_quiz != 0).sum().item()
-                        print(f"Starting from partial quiz with {num_known}/{comp_samples * seq_len} known values")
+
+                        if sudoku_input_type == 'quiz_solution':
+                            # For quiz+solution mode: quiz+SEP+EOF given, only denoise solution
+                            # Format: quiz(0-80) + SEP(81) + solution(82-162, masked) + EOF(163)
+                            xt = torch.full((comp_samples, seq_len), model.mask_index, dtype=torch.long, device=device)
+                            xt[:, :81] = test_quiz[:, :81]  # Quiz portion is given
+                            xt[:, 81] = SEP_TOKEN_ID  # SEP token
+                            # Positions 82-162 remain masked (solution to denoise)
+                            xt[:, 163] = EOF_TOKEN_ID  # EOF token
+                            num_known = 83 * comp_samples  # 81 (quiz) + 1 (SEP) + 1 (EOF)
+                            print(f"Quiz+solution mode: quiz+SEP+EOF given (83 tokens), denoising solution portion only (81 tokens)")
+                        else:
+                            # Default mode: use quiz as partial input (non-zero values are kept)
+                            xt = torch.where(test_quiz != 0, test_quiz, torch.full_like(test_quiz, model.mask_index))
+                            num_known = (test_quiz != 0).sum().item()
+
+                        print(f"Starting from partial input with {num_known}/{comp_samples * seq_len} known values")
 
                         comp_preds = model.generate(xt, steps=mdm_sampling_steps, temperature=mdm_temperature)
 
@@ -1804,6 +2815,131 @@ def main(**args):
                             max_display=5
                         )
 
+            if step % 1000 == 0 and model_type == 'dva':
+                # ===== DVA MODEL SAMPLING =====
+                # Based on generate_samples method in trainer.py (lines 154-213)
+                n_samples = args.get('n_samples', 100)
+                dva_sampling_steps = model.diffusion_args.diffusion_steps
+
+                with torch.no_grad():
+                    model.eval()
+
+                    # Define src_mask for the dataset
+                    # For sudoku quiz_solution mode: quiz+SEP+EOF are given (not masked)
+                    if dataset_type == 'sudoku' and sudoku_input_type == 'quiz_solution':
+                        # Load test quiz data if available
+                        test_quiz_path = args.get('test_quiz_path', 'data_vmd/sudoku_test.csv')
+                        if os.path.exists(test_quiz_path):
+                            test_quiz, _ = load_sudoku_dataset(test_quiz_path)
+                            rand_test_ids = torch.randperm(test_quiz.size(0))[:n_samples]
+                            test_quiz = test_quiz[rand_test_ids].to(device)
+
+                            # Create x with quiz filled in
+                            x_gen = torch.full((n_samples, seq_len), tokenizer.mask_token_id, dtype=torch.long, device=device)
+                            x_gen[:, :81] = test_quiz[:n_samples, :81]  # Quiz portion
+                            x_gen[:, 81] = SEP_TOKEN_ID  # SEP token
+                            x_gen[:, 163] = EOF_TOKEN_ID  # EOF token
+
+                            # src_mask: True for positions that should NOT be masked
+                            src_mask = torch.zeros_like(x_gen, dtype=torch.bool)
+                            src_mask[:, :82] = True   # quiz (81) + SEP (1)
+                            src_mask[:, 163] = True   # EOF
+
+                            print(f"\nGenerating {n_samples} samples (quiz+solution mode) with {dva_sampling_steps} denoising steps...")
+                        else:
+                            # No quiz data, generate from scratch
+                            x_gen = torch.full((n_samples, seq_len), tokenizer.mask_token_id, dtype=torch.long, device=device)
+                            src_mask = torch.zeros_like(x_gen, dtype=torch.bool)
+                            print(f"\nGenerating {n_samples} samples with {dva_sampling_steps} denoising steps...")
+                    else:
+                        # For other datasets: generate from fully masked
+                        x_gen = torch.full((n_samples, seq_len), tokenizer.mask_token_id, dtype=torch.long, device=device)
+                        src_mask = torch.zeros_like(x_gen, dtype=torch.bool)
+                        print(f"\nGenerating {n_samples} samples with {dva_sampling_steps} denoising steps...")
+
+                    # init_maskable_mask: positions that CAN be masked (inverse of src_mask)
+                    init_maskable_mask = ~src_mask
+                    maskable_mask = init_maskable_mask.clone()
+                    attention_mask = torch.ones_like(x_gen)
+
+                    # Iterative denoising from T-1 to 0 (matching trainer.py lines 170-212)
+                    for t_step in range(dva_sampling_steps - 1, -1, -1):
+                        t_tensor = torch.full((n_samples,), t_step, device=device)
+
+                        # Forward through model
+                        logits = model(x_gen, t_tensor, attention_mask=attention_mask)
+                        logits = torch.cat([logits[:, 0:1], logits[:, :-1]], dim=1)
+
+                        # Get predictions (matching trainer.py lines 183-185)
+                        scores = torch.log_softmax(logits, dim=-1)
+                        # Clip scores beyond vocab_size (trainer.py line 184)
+                        scores[:, :, tokenizer.vocab_size:] = -1000
+                        x0_scores, x0 = scores.max(-1)
+
+                        # Keep non-maskable positions unchanged (trainer.py line 188)
+                        x0 = x_gen.masked_scatter(maskable_mask, x0[maskable_mask])
+
+                        if t_step > 0:
+                            # Use topk decoding to select which tokens to unmask
+                            if model.diffusion_args.topk_decoding:
+                                # Use topk_decoding_dva helper function (trainer.py lines 194-202)
+                                x_gen = topk_decoding_dva(
+                                    x0,
+                                    x0_scores,
+                                    model.diffusion_args.decoding_strategy,
+                                    init_maskable_mask,
+                                    t_step,
+                                    dva_sampling_steps,
+                                    tokenizer.mask_token_id
+                                )
+                            else:
+                                # Random unmasking (D3PM style) (trainer.py lines 204-210)
+                                unmask_prob = 1 / (t_step + 1)
+                                mask_to_x0 = torch.rand(x_gen.shape, device=device) < unmask_prob
+                                # Don't unmask somewhere already unmasked
+                                mask_to_x0 = torch.bitwise_and(mask_to_x0, maskable_mask)
+                                x_gen[mask_to_x0] = x0[mask_to_x0]
+                                maskable_mask.masked_fill_(mask_to_x0, False)
+                        else:
+                            # Final step: unmask everything (trainer.py line 212)
+                            x_gen = x0
+
+                    # Evaluate generated samples
+                    gen_preds = x_gen
+
+                    if dataset_type == 'sudoku':
+                        evaluate_and_display_sudoku(
+                            gen_preds,
+                            n_samples,
+                            mode_str="DVA Generation",
+                            writer=writer,
+                            step=step,
+                            prefix="dva_generation",
+                            max_display=5
+                        )
+                    elif dataset_type == 'text8':
+                        evaluate_and_display_text8(
+                            gen_preds,
+                            n_samples,
+                            mode_str="DVA Generation",
+                            writer=writer,
+                            step=step,
+                            prefix="dva_generation",
+                            max_display=10
+                        )
+                    else:
+                        evaluate_and_display_sequential(
+                            gen_preds,
+                            n_samples,
+                            mode_str="DVA Generation",
+                            writer=writer,
+                            step=step,
+                            prefix="dva_generation",
+                            max_display=50
+                        )
+
+                    model.train()
+
             if step % 1000 == 0 and model_type == 'combined':
                 # ===== COMBINED MODEL SAMPLING =====
                 n_samples = args.get('n_samples', 100)
@@ -1817,7 +2953,9 @@ def main(**args):
                         test_quiz_path = args.get('test_quiz_path', 'data_vmd/sudoku_test.csv')
                         if os.path.exists(test_quiz_path):
                             test_quiz, _ = load_sudoku_dataset(test_quiz_path)
-                            test_quiz = test_quiz[:n_samples].to(device)
+                            rand_test_ids = torch.randperm(test_quiz.size(0))[:n_samples]
+                            test_quiz = test_quiz[rand_test_ids].to(device)
+                            # test_quiz = test_quiz[:n_samples].to(device)
                             print(f"Loaded test quiz data from {test_quiz_path} for completion evaluation")
                             print(f"Quiz data shape: {test_quiz.shape}")
 
@@ -1962,6 +3100,16 @@ def main(**args):
                             prefix="generation",
                             max_display=0
                         )
+                    elif dataset_type == 'text8':
+                        evaluate_and_display_text8(
+                            final_preds_gen,
+                            n_samples,
+                            mode_str="Generation",
+                            writer=writer,
+                            step=step,
+                            prefix="generation",
+                            max_display=10
+                        )
 
                     # ===== 2. COMPLETION FROM PARTIAL QUIZ =====
                     if test_quiz is not None and dataset_type == 'sudoku':
@@ -1969,23 +3117,65 @@ def main(**args):
                         print("2. COMPLETION FROM PARTIAL QUIZ")
                         print(f"{'='*60}")
 
+                        
                         # Start from partially masked
-                        xt_comp = torch.where(test_quiz != 0, test_quiz, torch.full_like(test_quiz, model.mask_index))
-                        num_known = (test_quiz != 0).sum().item()
-                        print(f"Starting from partial quiz with {num_known}/{n_samples * seq_len} known values")
+                        if sudoku_input_type == 'quiz_solution':
+                            # test_quiz contains full sequence [batch, 164]
+                            # Initialize xt_comp with quiz known, solution masked
+                            x_temp = torch.full((n_samples, seq_len), model.mask_index, dtype=torch.long, device=device)
+                            x_temp[:, :81] = test_quiz[:, :81]  # Quiz portion
+                            x_temp[:, 81] = SEP_TOKEN_ID  # SEP token
+                            x_temp[:, 163] = EOF_TOKEN_ID  # EOF token
+                            test_quiz = x_temp
+                            
+                            xt_comp = test_quiz.clone()
+                            xt_comp[:, 82:163] = model.mask_index  # Mask solution portion only
+                            num_known = (xt_comp != model.mask_index).sum().item()
+                            print(f"Starting from quiz_solution mode with {num_known}/{n_samples * seq_len} known values")
 
-                        # Initialize embeddings (z_t component)
-                        mask_only = (xt_comp == model.mask_index).unsqueeze(-1)
-                        # Initialize with random noise for masked positions
-                        xt_embed_comp = torch.randn(n_samples, seq_len, embed_dim, device=device)
+                            # For continuous latent: keep quiz+SEP+EOF clean, noise for solution only
+                            full_embed = torch.randn((test_quiz.shape[0], seq_len, embed_dim), dtype=torch.float32, device=device)
+                            full_embed[:, :81, :] = model.embed(test_quiz[:, :81])      # Quiz (clean)
+                            full_embed[:, 81:82, :] = model.embed(test_quiz[:, 81:82])  # SEP (clean)
+                            full_embed[:, 163:164, :] = model.embed(test_quiz[:, 163:164])  # EOF (clean)
+                            # Positions 82-162 remain random noise (solution)
 
-                        if combine_method == 'add':
-                            # ADD mode: z_t should be random noise for masked, zero for known
-                            xt_embed_comp = torch.where(mask_only, xt_embed_comp, torch.zeros_like(xt_embed_comp))
-                        else:  # concat
-                            # CONCAT mode: z_t should be random noise for masked, clean embeddings for known
-                            known_embed = model.embed(xt_comp)
-                            xt_embed_comp = torch.where(mask_only, xt_embed_comp, known_embed)
+                            quiz_sep_embed_comp = full_embed[:, :82, :]
+                            solution_noise_comp = full_embed[:, 82:163, :]
+                            eof_embed_comp = full_embed[:, 163:164, :]
+
+                            if combine_method == 'add':
+                                # ADD mode: quiz+EOF are zero, solution is noise
+                                xt_embed_comp = torch.cat([
+                                    torch.zeros_like(quiz_sep_embed_comp),
+                                    solution_noise_comp * sqrt_one_minus_alpha_start,
+                                    torch.zeros_like(eof_embed_comp)
+                                ], dim=1)
+                            else:  # concat
+                                # CONCAT mode: quiz+EOF are clean, solution is noise
+                                xt_embed_comp = torch.cat([
+                                    quiz_sep_embed_comp,
+                                    solution_noise_comp * sqrt_one_minus_alpha_start,
+                                    eof_embed_comp
+                                ], dim=1)
+                        else:
+                            # solution_only mode: original behavior
+                            xt_comp = torch.where(test_quiz != 0, test_quiz, torch.full_like(test_quiz, model.mask_index))
+                            num_known = (test_quiz != 0).sum().item()
+                            print(f"Starting from partial quiz with {num_known}/{n_samples * seq_len} known values")
+
+                            # Initialize embeddings (z_t component)
+                            mask_only = (xt_comp == model.mask_index).unsqueeze(-1)
+                            # Initialize with random noise for masked positions
+                            xt_embed_comp = torch.randn(n_samples, seq_len, embed_dim, device=device)
+
+                            if combine_method == 'add':
+                                # ADD mode: z_t should be random noise for masked, zero for known
+                                xt_embed_comp = torch.where(mask_only, xt_embed_comp, torch.zeros_like(xt_embed_comp))
+                            else:  # concat
+                                # CONCAT mode: z_t should be random noise for masked, clean embeddings for known
+                                known_embed = model.embed(xt_comp)
+                                xt_embed_comp = torch.where(mask_only, xt_embed_comp, known_embed)
 
                         # Compute transfer schedule
                         initial_mask_comp = xt_comp == model.mask_index
@@ -2053,13 +3243,30 @@ def main(**args):
                             confidence = torch.where(mask_positions, x0_p, neg_inf)
                             x0_pred = torch.where(mask_positions, x0_pred, xt_comp)
 
-                            transfer_index = torch.zeros_like(x0_pred, dtype=torch.bool, device=device)
-                            for j in range(confidence.size(0)):
-                                if num_transfer_tokens_comp[j, i] > 0:
-                                    _, select_index = torch.topk(confidence[j], k=num_transfer_tokens_comp[j, i])
-                                    transfer_index[j, select_index] = True
+                            if sudoku_input_type == 'quiz_solution':
+                                # Only consider solution positions for unmasking
+                                # Mask out quiz+SEP+EOF positions from confidence
+                                non_solution_mask = torch.ones_like(confidence, dtype=torch.bool)
+                                non_solution_mask[:, 82:163] = False  # Allow solution positions
+                                confidence_filtered = confidence.masked_fill(non_solution_mask, float('-inf'))
 
-                            xt_comp[transfer_index] = x0_pred[transfer_index]
+                                # Select top-k from solution positions only
+                                transfer_index = torch.zeros_like(x0_pred, dtype=torch.bool, device=device)
+                                for j in range(confidence_filtered.size(0)):
+                                    if num_transfer_tokens_comp[j, i] > 0:
+                                        _, select_index = torch.topk(confidence_filtered[j], k=num_transfer_tokens_comp[j, i])
+                                        transfer_index[j, select_index] = True
+
+                                xt_comp[transfer_index] = x0_pred[transfer_index]
+                            else:
+                                # Original behavior
+                                transfer_index = torch.zeros_like(x0_pred, dtype=torch.bool, device=device)
+                                for j in range(confidence.size(0)):
+                                    if num_transfer_tokens_comp[j, i] > 0:
+                                        _, select_index = torch.topk(confidence[j], k=num_transfer_tokens_comp[j, i])
+                                        transfer_index[j, select_index] = True
+
+                                xt_comp[transfer_index] = x0_pred[transfer_index]
 
                             if i < combined_sampling_steps - 1:
                                 x_clean_pred = model.embed(x0_pred)
@@ -2081,18 +3288,46 @@ def main(**args):
                                     sqrt_one_minus_alpha_curr = torch.sqrt(1.0 - alpha_curr).view(1, 1, 1)
                                     sqrt_one_minus_alpha_next = torch.sqrt(1.0 - alpha_next).view(1, 1, 1)
 
-                                    # Denoise using z_t (not z_combined)
-                                    z_t_curr = torch.where(mask_still, xt_embed_comp, torch.zeros_like(xt_embed_comp))
-                                    eps_pred = (z_t_curr - sqrt_alpha_curr * x_clean_pred) / (sqrt_one_minus_alpha_curr + 1e-8)
-                                    xt_embed_denoised = sqrt_alpha_next * x_clean_pred + sqrt_one_minus_alpha_next * eps_pred
-                                    # Update: masked positions get denoised, unmasked get zero, known get zero (will be handled by discrete embedding)
-                                    xt_embed_comp = torch.where(mask_still, xt_embed_denoised, torch.zeros_like(xt_embed_comp))
+                                    if sudoku_input_type == 'quiz_solution':
+                                        # Only denoise solution portion (positions 82-162)
+                                        x_clean_pred_solution = x_clean_pred[:, 82:163, :]
+                                        mask_still_solution = mask_still[:, 82:163, :]
+                                        z_t_curr_solution = xt_embed_comp[:, 82:163, :]
+
+                                        if mask_still_solution.any():
+                                            # Denoise only solution embeddings
+                                            eps_pred_solution = (z_t_curr_solution - sqrt_alpha_curr * x_clean_pred_solution) / (sqrt_one_minus_alpha_curr + 1e-8)
+                                            xt_embed_denoised_solution = sqrt_alpha_next * x_clean_pred_solution + sqrt_one_minus_alpha_next * eps_pred_solution
+
+                                            # Update only solution portion
+                                            xt_embed_comp[:, 82:163, :] = torch.where(
+                                                mask_still_solution,
+                                                xt_embed_denoised_solution,
+                                                xt_embed_comp[:, 82:163, :]
+                                            )
+                                    else:
+                                        # Original behavior
+                                        # Denoise using z_t (not z_combined)
+                                        z_t_curr = torch.where(mask_still, xt_embed_comp, torch.zeros_like(xt_embed_comp))
+                                        eps_pred = (z_t_curr - sqrt_alpha_curr * x_clean_pred) / (sqrt_one_minus_alpha_curr + 1e-8)
+                                        xt_embed_denoised = sqrt_alpha_next * x_clean_pred + sqrt_one_minus_alpha_next * eps_pred
+                                        # Update: masked positions get denoised, unmasked get zero, known get zero (will be handled by discrete embedding)
+                                        xt_embed_comp = torch.where(mask_still, xt_embed_denoised, torch.zeros_like(xt_embed_comp))
                                 else:
                                     # All positions unmasked, set z_t to zero
-                                    xt_embed_comp = torch.zeros_like(xt_embed_comp)
+                                    if sudoku_input_type != 'quiz_solution':
+                                        xt_embed_comp = torch.zeros_like(xt_embed_comp)
 
                         # Final completion predictions
-                        final_preds_comp = xt_comp
+                        if sudoku_input_type == 'quiz_solution':
+                            # Ensure quiz+SEP+EOF remain unchanged
+                            final_preds_comp = torch.cat([
+                                test_quiz[:, :82],           # quiz + SEP (given)
+                                xt_comp[:, 82:163],          # solution (predicted)
+                                test_quiz[:, 163:164]        # EOF (given)
+                            ], dim=1)
+                        else:
+                            final_preds_comp = xt_comp
 
                         # Display completion results side-by-side
                         print("\nCompletion samples (Quiz | Prediction):")
@@ -2112,6 +3347,7 @@ def main(**args):
                 n_samples = args.get('n_samples', 100)
                 ccdd_sampling_steps = args.get('ccdd_sampling_steps', 20)  # Number of denoising steps
                 ccdd_eta_ddpm = args.get('ccdd_eta_ddpm', 0.0)  # 0=DDIM, 1=DDPM
+                ccdd_temperature = args.get('ccdd_temperature', 0.0)  # Gumbel noise temperature for sampling
 
                 with torch.no_grad():
                     # Load test quiz data for completion evaluation
@@ -2120,7 +3356,9 @@ def main(**args):
                         test_quiz_path = args.get('test_quiz_path', 'data_vmd/sudoku_test.csv')
                         if os.path.exists(test_quiz_path):
                             test_quiz, _ = load_sudoku_dataset(test_quiz_path)
-                            test_quiz = test_quiz[:n_samples].to(device)
+                            rand_test_ids = torch.randperm(test_quiz.size(0))[:n_samples]
+                            test_quiz = test_quiz[rand_test_ids].to(device)
+                            # test_quiz = test_quiz[:n_samples].to(device)
                             print(f"Loaded test quiz data from {test_quiz_path} for completion evaluation")
                             print(f"Quiz data shape: {test_quiz.shape}")
 
@@ -2156,8 +3394,9 @@ def main(**args):
                         epsilon_pred, logits_pred = model(x_t, ccdd_continuous_coef * z_t, t_tensor)
 
                         # ===== (A) Discrete reverse: MDM-style unmasking =====
-                        # Deterministic argmax (no temperature)
-                        x0_pred = torch.argmax(logits_pred, dim=-1)  # [B, L]
+                        # Add Gumbel noise for stochastic sampling
+                        logits_with_noise = add_gumbel_noise(logits_pred, temperature=ccdd_temperature)
+                        x0_pred = torch.argmax(logits_with_noise, dim=-1)  # [B, L]
 
                         # Compute confidence (softmax probability of predicted token)
                         probs = F.softmax(logits_pred, dim=-1)  # [B, L, V]
@@ -2243,6 +3482,16 @@ def main(**args):
                             prefix="generation",
                             max_display=50
                         )
+                    elif dataset_type == 'text8':
+                        evaluate_and_display_text8(
+                            final_preds_gen,
+                            n_samples,
+                            mode_str="Generation",
+                            writer=writer,
+                            step=step,
+                            prefix="generation",
+                            max_display=10
+                        )
 
                     # ===== 2. COMPLETION FROM PARTIAL QUIZ =====
                     if test_quiz is not None and dataset_type == 'sudoku':
@@ -2273,8 +3522,9 @@ def main(**args):
                             epsilon_pred, logits_pred = model(x_t_comp, ccdd_continuous_coef * z_t_comp, t_tensor)
 
                             # ===== Discrete reverse: MDM-style (only unmask unknown positions) =====
-                            # Deterministic argmax
-                            x0_pred = torch.argmax(logits_pred, dim=-1)
+                            # Add Gumbel noise for stochastic sampling
+                            logits_with_noise = add_gumbel_noise(logits_pred, temperature=ccdd_temperature)
+                            x0_pred = torch.argmax(logits_with_noise, dim=-1)
 
                             # Compute confidence
                             probs = F.softmax(logits_pred, dim=-1)

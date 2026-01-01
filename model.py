@@ -7,6 +7,7 @@ import math
 import torch
 import torch.nn.functional as F
 from torch import nn
+from dataclasses import dataclass
 
 try:  # pragma: no cover - optional dependency
     from transformers import GPT2Config
@@ -28,6 +29,114 @@ __all__ = [
     "SimpleDiffusionModel",
     "CCDDModel",
 ]
+from transformers import AutoConfig, AutoModelForCausalLM
+import torch.nn as nn
+import torch
+
+class DiffusionModel(nn.Module):
+    """
+    diffusion model
+    """
+
+    def __init__(
+        self,
+        model,
+        config,
+        diffusion_args
+    ):
+        super().__init__()
+
+        self.model = model
+        self.config = self.model.config
+        self.embed_dim = self.config.hidden_size
+        self.hidden_dim = self.config.hidden_size
+        self.vocab_size = config.vocab_size
+        self.embed_tokens = self.model.transformer.wte
+        self.denoise_model = self.model.transformer # use inputs_embeds instead of input_ids in forward function
+        for gpt2block in self.model.transformer.h:
+            gpt2block.attn.bias.fill_(True)  # remove causal mask
+        self.lm_head = self.model.lm_head
+        self.diffusion_args = diffusion_args
+        self.mask_index = 13
+
+    def get_logits(self, hidden_repr):
+        return self.lm_head(hidden_repr)
+
+    def get_input_embeddings(self):
+        return self.embed_tokens
+    
+    def get_embeds(self, input_ids):
+        return self.embed_tokens(input_ids)
+    
+    def forward(self, input_ids, t=None, attention_mask=None):
+        """
+        denoise the input
+        """
+        x_embed = self.get_embeds(input_ids)
+        
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids) 
+
+        x = self.denoise_model(inputs_embeds = x_embed, attention_mask=attention_mask, return_dict = False)[0]
+
+        logits = self.get_logits(x)
+
+        return logits
+
+config = AutoConfig.from_pretrained('/home/kt19/plaid/low_res/diffusion-language/diffusion-vs-ar/model_config_tiny', trust_remote_code=True)
+print(f"Model config loaded: {config.model_type}")
+print(f"  - Layers: {config.n_layer}")
+print(f"  - Hidden size: {config.n_embd}")
+print(f"  - Attention heads: {config.n_head}")
+print(f"  - Vocab size: {config.vocab_size}")
+
+model = AutoModelForCausalLM.from_config(
+            config,
+        ) 
+
+@dataclass
+class DiffusionArgs:
+    """Arguments for diffusion model training."""
+    diffusion_steps: int = 20
+    token_reweighting: bool = True
+    alpha: float = 0.25  # Focal loss alpha
+    gamma: float = 1.0   # Focal loss gamma
+    time_reweighting: str = 'linear'  # 'original', 'linear', or 'none'
+    topk_decoding: bool = True
+    decoding_strategy: str = 'stochastic0.5-linear'
+
+diffusion_args = DiffusionArgs(
+    diffusion_steps=20,
+    token_reweighting=True,
+    alpha=0.25,
+    gamma=1.0,
+    time_reweighting='linear',
+    topk_decoding=True,
+    decoding_strategy='stochastic0.5-linear'
+)
+dva_model = DiffusionModel(model, config, diffusion_args)
+
+@dataclass(frozen=True)
+class FixedVocabTokenizer:
+    vocab_size: int
+    mask_token_id: int
+    sep_token_id: int
+    eos_token_id: int
+    pad_token_id: int = 0
+    unk_token_id: int = 0
+
+
+# Match Sudoku dataset token IDs:
+# digits 0-9, mask=10, SEP=11, EOF=12.
+dva_tokenizer = FixedVocabTokenizer(
+    vocab_size=13,
+    mask_token_id=10,
+    sep_token_id=11,
+    eos_token_id=12,
+    pad_token_id=0,
+    unk_token_id=0,
+)
+
 
 
 def llada_mask(x0: torch.Tensor, t: torch.Tensor, mask_index: int):
@@ -148,7 +257,7 @@ class MaskedPredictor(nn.Module):
         self.input_proj = nn.Linear(input_dim, self.hidden_dim, bias=False)
 
         # Positional embeddings (same options as SimpleDiffusionModel)
-        if self.dataset_type == "sudoku" and self.positional_encoding == "sinusoidal":
+        if False:
             # Use 2D positional encoding for sudoku (9x9 grid = 81 positions)
             pe = SimpleDiffusionModel._build_2d_sinusoidal_embedding(9, 9, self.hidden_dim)
             self.register_buffer("pos_embedding", pe, persistent=False)
@@ -436,6 +545,8 @@ class MaskedPredictor(nn.Module):
             # Get model predictions using new architecture
             # Time value decreases from 1.0 to 0.0 as we unmask
             t_val = 1.0 - (i / max(steps - 1, 1)) * 1.0
+            
+            print("sampling with t_val: ", t_val)
             logits = self._forward_without_loss(xt, t_disc=t_val, t_cont=t_val)
 
             # Sample with Gumbel noise
